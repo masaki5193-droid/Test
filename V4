@@ -1,0 +1,2910 @@
+import pandas as pd
+import json
+import os
+import re
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+
+def clean_val(val):
+    if pd.isna(val):
+        return ""
+    val_str = str(val).replace('?', '').strip()
+    if val_str.lower() == "nan":
+        return ""
+    return val_str
+
+
+def clean_id(val):
+    """Excel数値読み込み時の '.0' 付与を除去してID文字列を正規化"""
+    s = clean_val(val)
+    if not s:
+        return ""
+    return re.sub(r'\.0$', '', s)
+
+
+def parse_hours(val):
+    """「3,950時間」「208時間?」などから数値(float)を抽出"""
+    s = clean_val(val)
+    if not s:
+        return 0.0
+    s_num = re.sub(r'[^0-9.\-]', '', s.replace(',', ''))
+    try:
+        return float(s_num) if s_num else 0.0
+    except ValueError:
+        return 0.0
+
+
+def parse_id_list(val):
+    """カンマ区切りなどの先行・後続タスクIDを配列化"""
+    s = clean_val(val)
+    if not s or s == "N/A":
+        return []
+    parts = re.split(r'[,、\s]+', s)
+    result = []
+    for p in parts:
+        cleaned = re.sub(r'\.0$', '', p.strip())
+        if cleaned:
+            result.append(cleaned)
+    return result
+
+
+def get_col_val(row, col_names, df_columns):
+    for name in col_names:
+        if name in df_columns:
+            return clean_val(row[name])
+    return ""
+
+
+def format_date_iso(date_str):
+    """「YYYY年MM月DD日 8:00」や「26/01/15 (木)」を「YYYY-MM-DD」に正規化"""
+    if not date_str or str(date_str) == "N/A":
+        return ""
+    s = str(date_str).strip()
+
+    # 4桁年 (例: 2025年10月15日 8:00, 2025/10/15, 2025-10-15)
+    m4 = re.search(r'(\d{4})[年/\-](\d{1,2})[月/\-](\d{1,2})', s)
+    if m4:
+        return f"{int(m4.group(1)):04d}-{int(m4.group(2)):02d}-{int(m4.group(3)):02d}"
+
+    # 2桁年 (例: 26/01/15 (木))
+    m2 = re.search(r'(?<!\d)(\d{2})[年/\-](\d{1,2})[月/\-](\d{1,2})', s)
+    if m2:
+        year = 2000 + int(m2.group(1))
+        return f"{year:04d}-{int(m2.group(2)):02d}-{int(m2.group(3)):02d}"
+
+    return ""
+
+
+def main():
+    root = tk.Tk()
+    root.withdraw()
+    file_path = filedialog.askopenfilename(
+        title="WBSのExcelまたはCSVファイルを選択してください",
+        filetypes=[("Excel files", "*.xlsx *.xls"), ("CSV files", "*.csv")]
+    )
+
+    if not file_path:
+        print("キャンセルされました。")
+        return
+
+    try:
+        if file_path.endswith('.csv'):
+            try:
+                df = pd.read_csv(file_path, encoding='utf-8-sig')
+            except Exception:
+                df = pd.read_csv(file_path, encoding='cp932')
+        else:
+            df = pd.read_excel(file_path)
+
+        tasks = []
+        last_at_level = {}
+        top_level_id = None
+
+        for _, row in df.iterrows():
+            raw_prog = get_col_val(row, ["達成率", "進捗率"], df.columns)
+            try:
+                progress = float(raw_prog)
+            except Exception:
+                progress = 0.0
+
+            lvl_str = clean_id(get_col_val(row, ["アウトライン_レベル", "アウトライン"], df.columns))
+            try:
+                lvl = int(lvl_str)
+            except Exception:
+                lvl = 1
+
+            task_id = clean_id(get_col_val(row, ["ID", "ＩＤ"], df.columns))
+            if not task_id:
+                continue
+
+            # 親子関係の特定
+            parent_id = None
+            if lvl == 1:
+                top_level_id = task_id
+            elif lvl > 1:
+                parent_id = last_at_level.get(lvl - 1)
+
+            last_at_level[lvl] = task_id
+
+            work_hours_str = get_col_val(row, ["作業時間"], df.columns)
+
+            # HTML作成対象外の列（総合余裕期間、成果物ID/タイプ/ステータス、固有ID、作業時間仮設定）は除外
+            task = {
+                'id': task_id,
+                'level': lvl,
+                'parent_id': parent_id,
+                'top_parent_id': top_level_id if lvl > 1 else task_id,
+                'name': get_col_val(row, ["タスク名"], df.columns),
+                'work_hours': work_hours_str,
+                'work_hours_num': parse_hours(work_hours_str),
+                'duration': get_col_val(row, ["期間"], df.columns),
+                'start': format_date_iso(get_col_val(row, ["開始日"], df.columns)),
+                'end': format_date_iso(get_col_val(row, ["終了日"], df.columns)),
+                'deadline': format_date_iso(get_col_val(row, ["期限"], df.columns)),
+                'resource': get_col_val(row, ["リソース名", "リソース"], df.columns),
+                'stakeholder': get_col_val(row, ["関係者"], df.columns),
+                'predecessors': parse_id_list(get_col_val(row, ["先行タスク"], df.columns)),
+                'successors': parse_id_list(get_col_val(row, ["後続タスク"], df.columns)),
+                'progress': progress,
+                'has_children': False
+            }
+            tasks.append(task)
+
+        # 子タスクを持つ親タスクのフラグ設定
+        parent_ids = {t['parent_id'] for t in tasks if t['parent_id']}
+        for t in tasks:
+            if t['id'] in parent_ids:
+                t['has_children'] = True
+
+        json_data = json.dumps(tasks, ensure_ascii=False)
+
+        html_template = r"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WBS DASHBOARD</title>
+    <style>
+        :root {
+            --bg-color: #030712;
+            --panel-bg: rgba(13, 22, 46, 0.76);
+            --neon-blue: #00f3ff;
+            --neon-purple: #bc13fe;
+            --neon-green: #00ff66;
+            --neon-amber: #ffaa00;
+            --neon-red: #ff2a5f;
+            --text-main: #e2e8f0;
+            --text-muted: #64748b;
+            --border-glow: rgba(0, 243, 255, 0.22);
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', system-ui, sans-serif; }
+        body {
+            background: radial-gradient(circle at top, #0a1128 0%, var(--bg-color) 100%);
+            color: var(--text-main);
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            position: relative;
+        }
+
+        /* =========================================================
+           BOOT & VIEW TRANSITION ANIMATIONS
+        ========================================================= */
+        @keyframes bootScanline {
+            0% { top: -4px; opacity: 1; }
+            85% { opacity: 0.8; }
+            100% { top: 100vh; opacity: 0; }
+        }
+        @keyframes headerSlideDown {
+            from { opacity: 0; transform: translateY(-18px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        @keyframes panelRiseIn {
+            from { opacity: 0; transform: translateY(16px) scale(0.99); }
+            to { opacity: 1; transform: translateY(0) scale(1); }
+        }
+        @keyframes ganttBarGrow {
+            from { transform: scaleX(0); opacity: 0.15; }
+            to { transform: scaleX(1); opacity: 1; }
+        }
+        @keyframes depFadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        @keyframes svgBarRise {
+            from { transform: scaleY(0); opacity: 0; }
+            to { transform: scaleY(1); opacity: 1; }
+        }
+        @keyframes targetNodePulse {
+            0%, 100% { stroke-opacity: 0.9; stroke-width: 2.5; }
+            50% { stroke-opacity: 0.35; stroke-width: 5; }
+        }
+
+        .boot-scanline {
+            position: fixed;
+            left: 0;
+            width: 100%;
+            height: 3px;
+            background: linear-gradient(90deg, transparent, var(--neon-blue), var(--neon-purple), transparent);
+            box-shadow: 0 0 16px var(--neon-blue);
+            z-index: 9999;
+            pointer-events: none;
+            animation: bootScanline 1.1s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+        }
+
+        .animate-header {
+            animation: headerSlideDown 0.55s cubic-bezier(0.16, 1, 0.3, 1) both;
+        }
+        .animate-panel {
+            opacity: 0;
+            animation: panelRiseIn 0.55s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+        }
+        .delay-1 { animation-delay: 0.06s; }
+        .delay-2 { animation-delay: 0.14s; }
+        .delay-3 { animation-delay: 0.22s; }
+
+        /* Header */
+        .header {
+            padding: 12px 26px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border-glow);
+            background: rgba(3, 7, 18, 0.9);
+            backdrop-filter: blur(10px);
+            z-index: 100;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        .header-left { display: flex; align-items: center; gap: 16px; }
+        .header h1 {
+            font-size: 1.4rem;
+            letter-spacing: 3px;
+            color: var(--neon-blue);
+            text-shadow: 0 0 12px var(--neon-blue);
+        }
+        .today-badge {
+            font-family: monospace;
+            font-size: 0.82rem;
+            padding: 4px 10px;
+            border: 1px solid rgba(0, 243, 255, 0.4);
+            border-radius: 4px;
+            color: var(--neon-blue);
+            background: rgba(0, 243, 255, 0.08);
+        }
+
+        .header-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+        .tabs { display: flex; gap: 8px; flex-wrap: wrap; }
+        .tab-btn {
+            background: transparent;
+            border: 1px solid var(--text-muted);
+            color: var(--text-muted);
+            padding: 7px 14px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 0.78rem;
+            letter-spacing: 1px;
+            transition: 0.25s;
+        }
+        .tab-btn:hover { border-color: var(--neon-blue); color: var(--neon-blue); box-shadow: 0 0 8px rgba(0,243,255,0.3) inset; }
+        .tab-btn.active { border-color: var(--neon-blue); color: var(--bg-color); background: var(--neon-blue); box-shadow: 0 0 12px var(--neon-blue); }
+
+        .print-btn {
+            background: rgba(188, 19, 254, 0.16);
+            border: 1px solid var(--neon-purple);
+            color: #e9a8ff;
+            padding: 7px 14px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 0.78rem;
+            letter-spacing: 1px;
+            transition: 0.25s;
+        }
+        .print-btn:hover {
+            background: var(--neon-purple);
+            color: #fff;
+            box-shadow: 0 0 12px var(--neon-purple);
+        }
+
+        .view-container { flex: 1; overflow-y: auto; padding: 16px 24px; position: relative; }
+        .view { display: none; height: 100%; }
+        .view.active { display: flex; flex-direction: column; }
+
+        /* Panels & Collapsible Sections */
+        .panel {
+            background: var(--panel-bg);
+            backdrop-filter: blur(8px);
+            border: 1px solid var(--border-glow);
+            border-radius: 8px;
+            padding: 14px 16px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+            display: flex;
+            flex-direction: column;
+            transition: padding 0.2s;
+        }
+        .panel.collapsed { padding-bottom: 12px; }
+        .panel.collapsed .panel-body { display: none; }
+        .panel.collapsed .panel-header { margin-bottom: 0; border-bottom-color: transparent; padding-bottom: 0; }
+
+        .panel-header {
+            font-size: 0.92rem;
+            color: var(--neon-purple);
+            border-bottom: 1px solid rgba(188, 19, 254, 0.3);
+            padding-bottom: 8px;
+            margin-bottom: 12px;
+            letter-spacing: 1px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .panel-title-clickable {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            cursor: pointer;
+            user-select: none;
+        }
+        .panel-title-clickable:hover { opacity: 0.85; }
+        .section-chevron {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 20px;
+            height: 20px;
+            border-radius: 4px;
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            color: var(--neon-blue);
+            font-family: monospace;
+            font-size: 0.78rem;
+            transition: transform 0.2s, background 0.2s;
+        }
+        .panel.collapsed .section-chevron { transform: rotate(-90deg); }
+
+        /* Alert Panel */
+        .alert-panel {
+            border-color: rgba(255, 42, 95, 0.45);
+            margin-bottom: 14px;
+            background: linear-gradient(90deg, rgba(255, 42, 95, 0.09) 0%, rgba(13, 22, 46, 0.8) 100%);
+        }
+        .alert-title { color: var(--neon-red); text-shadow: 0 0 8px rgba(255, 42, 95, 0.6); font-weight: bold; }
+        .alert-count-badge {
+            font-size: 0.74rem;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-family: monospace;
+            font-weight: bold;
+        }
+        .badge-overdue { background: rgba(255, 42, 95, 0.25); border: 1px solid var(--neon-red); color: #ff80a0; }
+        .badge-soon { background: rgba(255, 170, 0, 0.2); border: 1px solid var(--neon-amber); color: #ffd066; }
+        .badge-ok { background: rgba(0, 255, 102, 0.15); border: 1px solid var(--neon-green); color: var(--neon-green); }
+
+        .alert-list {
+            display: flex;
+            gap: 10px;
+            overflow-x: auto;
+            padding-bottom: 4px;
+        }
+        .alert-card {
+            min-width: 235px;
+            max-width: 275px;
+            padding: 9px 12px;
+            border-radius: 6px;
+            background: rgba(0, 0, 0, 0.48);
+            border-left: 3px solid var(--neon-amber);
+            cursor: pointer;
+            transition: 0.2s;
+            flex-shrink: 0;
+        }
+        .alert-card:hover { transform: translateY(-2px); background: rgba(255, 255, 255, 0.08); }
+        .alert-card.overdue { border-left-color: var(--neon-red); box-shadow: 0 0 10px rgba(255, 42, 95, 0.16) inset; }
+        .alert-card-top { display: flex; justify-content: space-between; font-size: 0.74rem; font-family: monospace; margin-bottom: 4px; }
+        .alert-card-name { font-size: 0.84rem; font-weight: bold; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 4px; }
+        .alert-card-meta { font-size: 0.74rem; color: var(--text-muted); display: flex; justify-content: space-between; }
+
+        /* Dashboard Grid */
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: 250px 1fr;
+            gap: 14px;
+            margin-bottom: 14px;
+            align-items: start;
+        }
+        @media (max-width: 900px) { .dashboard-grid { grid-template-columns: 1fr; } }
+
+        /* Charts */
+        .pie-container { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 6px 0; }
+        .bar-chart { display: flex; flex-direction: column; gap: 10px; overflow-y: auto; max-height: 175px; padding-right: 6px; }
+        .bar-item { display: flex; align-items: center; gap: 10px; font-size: 0.84rem; cursor: pointer; padding: 2px 4px; border-radius: 4px; }
+        .bar-item:hover { background: rgba(0, 243, 255, 0.08); }
+        .bar-label { width: 165px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .bar-track { flex: 1; background: rgba(255, 255, 255, 0.06); height: 7px; border-radius: 4px; position: relative; overflow: hidden; }
+        .bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--neon-purple), var(--neon-blue));
+            box-shadow: 0 0 8px var(--neon-blue);
+            border-radius: 4px;
+            transition: width 1.1s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+        .bar-percent { width: 42px; text-align: right; color: var(--neon-blue); font-family: monospace; }
+
+        /* Controls & Filters */
+        .filter-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+        .input-glow {
+            background: rgba(0, 0, 0, 0.55);
+            border: 1px solid var(--text-muted);
+            color: var(--text-main);
+            padding: 5px 10px;
+            border-radius: 4px;
+            outline: none;
+            font-size: 0.8rem;
+            transition: 0.25s;
+        }
+        .input-glow:focus { border-color: var(--neon-blue); box-shadow: 0 0 8px rgba(0,243,255,0.25); }
+        .mini-btn {
+            background: rgba(0, 243, 255, 0.08);
+            border: 1px solid rgba(0, 243, 255, 0.35);
+            color: var(--neon-blue);
+            padding: 5px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.76rem;
+            transition: 0.2s;
+        }
+        .mini-btn:hover { background: rgba(0, 243, 255, 0.2); }
+        .mini-btn.active { background: var(--neon-blue); color: #000; font-weight: bold; }
+
+        /* Table */
+        .table-container { overflow: auto; flex: 1; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 9px 10px; text-align: left; border-bottom: 1px solid rgba(255, 255, 255, 0.05); font-size: 0.83rem; }
+        th { color: var(--neon-blue); position: sticky; top: 0; background: rgba(10, 18, 38, 0.98); z-index: 10; font-weight: 500; white-space: nowrap; }
+        tbody tr { cursor: pointer; transition: background 0.15s; }
+        tbody tr:hover { background: rgba(0, 243, 255, 0.08); }
+        tbody tr.selected-row {
+            background: rgba(0, 243, 255, 0.16) !important;
+            box-shadow: inset 3px 0 0 var(--neon-blue);
+        }
+        .lvl-1 { font-weight: bold; background: rgba(0, 243, 255, 0.03); border-left: 2px solid var(--neon-blue); }
+        tr.row-overdue { background: rgba(255, 42, 95, 0.08); }
+        tr.row-soon { background: rgba(255, 170, 0, 0.06); }
+
+        .status-pill {
+            display: inline-block;
+            padding: 1px 6px;
+            border-radius: 3px;
+            font-size: 0.7rem;
+            font-family: monospace;
+            font-weight: bold;
+            margin-left: 6px;
+        }
+        .pill-overdue { background: rgba(255, 42, 95, 0.25); color: #ff6b93; border: 1px solid var(--neon-red); }
+        .pill-soon { background: rgba(255, 170, 0, 0.2); color: #ffc857; border: 1px solid var(--neon-amber); }
+
+        .toggle-btn {
+            cursor: pointer;
+            color: var(--neon-purple);
+            font-family: monospace;
+            font-size: 0.95rem;
+            font-weight: bold;
+            margin-right: 6px;
+            user-select: none;
+            display: inline-block;
+            width: 22px;
+            text-align: center;
+        }
+        .toggle-btn:hover { color: var(--neon-blue); text-shadow: 0 0 6px var(--neon-blue); }
+
+        /* =========================================================
+           RESOURCE WORKLOAD VIEW (DAILY HOURS ANALYTICS)
+        ========================================================= */
+        .res-summary-cards {
+            display: flex;
+            gap: 12px;
+            overflow-x: auto;
+            padding-bottom: 6px;
+            margin-bottom: 14px;
+        }
+        .res-card {
+            min-width: 210px;
+            background: rgba(10, 19, 42, 0.85);
+            border: 1px solid rgba(0, 243, 255, 0.25);
+            border-radius: 8px;
+            padding: 11px 14px;
+            cursor: pointer;
+            transition: border-color 0.2s, background 0.2s, transform 0.2s;
+            flex-shrink: 0;
+            animation: panelRiseIn 0.45s cubic-bezier(0.16, 1, 0.3, 1) backwards;
+        }
+        .res-card:hover { border-color: var(--neon-blue); transform: translateY(-2px); }
+        .res-card.active-res {
+            border-color: var(--neon-purple);
+            background: rgba(188, 19, 254, 0.14);
+            box-shadow: 0 0 14px rgba(188, 19, 254, 0.3);
+        }
+        .res-card-name { font-weight: bold; font-size: 0.9rem; color: var(--neon-blue); margin-bottom: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .res-card-stats { display: flex; justify-content: space-between; font-size: 0.76rem; color: var(--text-muted); font-family: monospace; margin-bottom: 6px; }
+        .res-card-bar { height: 5px; background: rgba(255,255,255,0.08); border-radius: 3px; overflow: hidden; }
+        .res-card-fill { height: 100%; background: linear-gradient(90deg, var(--neon-blue), var(--neon-purple)); transition: width 0.8s ease-out; }
+
+        .res-chart-scroll {
+            width: 100%;
+            overflow-x: auto;
+            background: rgba(2, 6, 18, 0.55);
+            border: 1px solid rgba(255, 255, 255, 0.07);
+            border-radius: 6px;
+            padding: 10px;
+        }
+        .res-bar-rect {
+            transform-box: fill-box;
+            transform-origin: bottom;
+            animation: svgBarRise 0.6s cubic-bezier(0.16, 1, 0.3, 1) backwards;
+        }
+
+        /* Graphical Day Breakdown Panel (Pie Chart + Task List) */
+        .day-breakdown-panel {
+            display: none;
+            margin-bottom: 12px;
+            padding: 14px 16px;
+            background: linear-gradient(135deg, rgba(13, 24, 52, 0.92) 0%, rgba(25, 14, 48, 0.85) 100%);
+            border: 1px solid var(--neon-blue);
+            border-radius: 8px;
+            box-shadow: 0 0 20px rgba(0, 243, 255, 0.14);
+            animation: panelRiseIn 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+        }
+        .day-breakdown-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid rgba(0, 243, 255, 0.25);
+            padding-bottom: 8px;
+            margin-bottom: 12px;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .day-breakdown-grid {
+            display: grid;
+            grid-template-columns: 185px 1fr;
+            gap: 18px;
+            align-items: center;
+        }
+        @media (max-width: 760px) {
+            .day-breakdown-grid { grid-template-columns: 1fr; }
+        }
+        .day-pie-box {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0, 0, 0, 0.35);
+            border: 1px solid rgba(255, 255, 255, 0.07);
+            border-radius: 8px;
+            padding: 10px;
+        }
+        .day-task-list {
+            display: flex;
+            flex-direction: column;
+            gap: 7px;
+            max-height: 180px;
+            overflow-y: auto;
+            padding-right: 4px;
+        }
+        .day-task-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            padding: 8px 12px;
+            background: rgba(0, 0, 0, 0.45);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 6px;
+            cursor: pointer;
+            transition: 0.2s;
+        }
+        .day-task-row:hover {
+            border-color: var(--neon-blue);
+            background: rgba(0, 243, 255, 0.1);
+            transform: translateX(3px);
+        }
+        .day-color-dot {
+            width: 11px;
+            height: 11px;
+            border-radius: 3px;
+            flex-shrink: 0;
+        }
+
+        .heatmap-table { border-collapse: collapse; font-family: monospace; font-size: 0.74rem; }
+        .heatmap-table th, .heatmap-table td {
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            padding: 5px 6px;
+            text-align: center;
+            min-width: 44px;
+            white-space: nowrap;
+        }
+        .heatmap-table th.sticky-res, .heatmap-table td.sticky-res {
+            position: sticky;
+            left: 0;
+            background: rgba(10, 18, 38, 0.98);
+            z-index: 12;
+            text-align: left;
+            min-width: 150px;
+            max-width: 180px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            font-weight: bold;
+            color: var(--neon-blue);
+        }
+        .hm-cell { cursor: pointer; transition: transform 0.12s; }
+        .hm-cell:hover { outline: 1px solid #fff; z-index: 5; position: relative; }
+        .hm-cell.hm-selected {
+            outline: 2px solid var(--neon-purple) !important;
+            box-shadow: inset 0 0 8px var(--neon-purple);
+            z-index: 6;
+            position: relative;
+        }
+        .hm-0 { color: rgba(255,255,255,0.18); }
+        .hm-low { background: rgba(0, 243, 255, 0.14); color: #a5f3fc; }
+        .hm-mid { background: rgba(0, 243, 255, 0.34); color: #ffffff; font-weight: bold; }
+        .hm-high { background: rgba(255, 170, 0, 0.35); color: #fde68a; font-weight: bold; }
+        .hm-over { background: rgba(255, 42, 95, 0.48); color: #ffffff; font-weight: bold; box-shadow: inset 0 0 6px var(--neon-red); }
+        .hm-weekend { background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.02) 0, rgba(255,255,255,0.02) 4px, transparent 4px, transparent 8px); }
+
+        /* =========================================================
+           TASK DETAIL HUD DRAWER (GRAPHICAL INSPECTOR)
+        ========================================================= */
+        .drawer-backdrop {
+            position: fixed;
+            inset: 0;
+            background: rgba(2, 6, 18, 0.58);
+            backdrop-filter: blur(3px);
+            z-index: 200;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.25s ease;
+        }
+        .drawer-backdrop.open {
+            opacity: 1;
+            pointer-events: auto;
+        }
+        .task-drawer {
+            position: fixed;
+            top: 0;
+            right: 0;
+            width: 680px;
+            max-width: 96vw;
+            height: 100vh;
+            background: linear-gradient(180deg, rgba(10, 19, 42, 0.98) 0%, rgba(4, 9, 22, 0.99) 100%);
+            border-left: 1px solid var(--neon-blue);
+            box-shadow: -10px 0 40px rgba(0, 0, 0, 0.85), 0 0 24px rgba(0, 243, 255, 0.18);
+            z-index: 210;
+            transform: translateX(102%);
+            transition: transform 0.32s cubic-bezier(0.16, 1, 0.3, 1);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .task-drawer.open {
+            transform: translateX(0);
+        }
+        .drawer-header {
+            padding: 16px 20px;
+            border-bottom: 1px solid rgba(0, 243, 255, 0.25);
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 12px;
+            background: rgba(0, 243, 255, 0.04);
+        }
+        .drawer-breadcrumbs {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            align-items: center;
+            font-size: 0.74rem;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+        }
+        .crumb-link {
+            color: var(--neon-blue);
+            cursor: pointer;
+            text-decoration: underline;
+            text-underline-offset: 2px;
+        }
+        .crumb-link:hover { color: #fff; }
+        .drawer-title-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .drawer-id-tag {
+            font-family: monospace;
+            font-size: 0.8rem;
+            padding: 2px 8px;
+            border-radius: 4px;
+            background: rgba(188, 19, 254, 0.2);
+            border: 1px solid var(--neon-purple);
+            color: #e9a8ff;
+        }
+        .drawer-task-name {
+            font-size: 1.12rem;
+            font-weight: bold;
+            color: #fff;
+            line-height: 1.35;
+        }
+        .drawer-close-btn {
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            color: var(--text-main);
+            width: 32px;
+            height: 32px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 1.1rem;
+            flex-shrink: 0;
+            transition: 0.2s;
+        }
+        .drawer-close-btn:hover {
+            border-color: var(--neon-red);
+            color: var(--neon-red);
+            background: rgba(255, 42, 95, 0.15);
+        }
+
+        .drawer-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 18px 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+        .hud-card {
+            background: rgba(13, 24, 52, 0.65);
+            border: 1px solid rgba(0, 243, 255, 0.2);
+            border-radius: 8px;
+            padding: 14px;
+        }
+        .hud-card-title {
+            font-size: 0.78rem;
+            font-family: monospace;
+            letter-spacing: 1.5px;
+            color: var(--neon-blue);
+            margin-bottom: 12px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+
+        .progress-hud-grid {
+            display: grid;
+            grid-template-columns: 130px 1fr;
+            gap: 16px;
+            align-items: center;
+        }
+        .dual-bar-group { display: flex; flex-direction: column; gap: 12px; }
+        .dual-bar-row { display: flex; flex-direction: column; gap: 4px; }
+        .dual-bar-label { display: flex; justify-content: space-between; font-size: 0.78rem; }
+        .dual-bar-track {
+            height: 8px;
+            background: rgba(255, 255, 255, 0.08);
+            border-radius: 4px;
+            overflow: hidden;
+            position: relative;
+        }
+        .dual-bar-fill-actual {
+            height: 100%;
+            background: linear-gradient(90deg, var(--neon-purple), var(--neon-green));
+            box-shadow: 0 0 8px var(--neon-green);
+            border-radius: 4px;
+        }
+        .dual-bar-fill-time {
+            height: 100%;
+            background: linear-gradient(90deg, #3b82f6, var(--neon-blue));
+            box-shadow: 0 0 8px var(--neon-blue);
+            border-radius: 4px;
+        }
+
+        .telemetry-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 8px;
+        }
+        .tele-box {
+            background: rgba(0, 0, 0, 0.4);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 6px;
+            padding: 8px 10px;
+        }
+        .tele-label { font-size: 0.7rem; color: var(--text-muted); margin-bottom: 3px; }
+        .tele-val { font-size: 0.88rem; font-weight: bold; font-family: monospace; color: var(--text-main); word-break: break-all; }
+
+        /* Full Chain Dependency Flow Diagram */
+        .dep-diagram-wrap {
+            width: 100%;
+            overflow-x: auto;
+            overflow-y: auto;
+            max-height: 360px;
+            background: rgba(2, 6, 18, 0.75);
+            border: 1px solid rgba(0, 243, 255, 0.25);
+            border-radius: 6px;
+            padding: 10px;
+        }
+        .dep-node-box { cursor: pointer; transition: opacity 0.2s; }
+        .dep-node-box:hover { opacity: 0.85; }
+        .current-node-pulse {
+            animation: targetNodePulse 1.8s infinite ease-in-out;
+        }
+
+        .subtask-mini-list { display: flex; flex-direction: column; gap: 6px; max-height: 190px; overflow-y: auto; }
+        .subtask-mini-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 10px;
+            padding: 7px 10px;
+            background: rgba(0, 0, 0, 0.4);
+            border: 1px solid rgba(255, 255, 255, 0.07);
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 0.8rem;
+        }
+        .subtask-mini-item:hover { border-color: var(--neon-blue); background: rgba(0, 243, 255, 0.08); }
+
+        /* Gantt Chart */
+        .gantt-toolbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+            padding: 8px 14px;
+            background: var(--panel-bg);
+            border: 1px solid var(--border-glow);
+            border-radius: 6px;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .gantt-legend { display: flex; gap: 14px; font-size: 0.78rem; color: var(--text-muted); align-items: center; flex-wrap: wrap; }
+        .legend-dot { width: 10px; height: 10px; border-radius: 2px; display: inline-block; margin-right: 4px; }
+
+        .gantt-wrapper {
+            display: flex;
+            flex: 1;
+            min-height: 0;
+            background: var(--panel-bg);
+            border: 1px solid var(--border-glow);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        .gantt-labels {
+            width: 320px;
+            flex-shrink: 0;
+            border-right: 1px solid rgba(0,243,255,0.25);
+            overflow-y: hidden;
+            background: rgba(3, 7, 18, 0.55);
+        }
+        .gantt-timeline-container { flex: 1; overflow: auto; position: relative; }
+        .gantt-timeline { position: relative; min-height: 100%; }
+
+        .g-header {
+            display: flex;
+            background: rgba(10, 18, 38, 0.98);
+            position: sticky;
+            top: 0;
+            z-index: 25;
+            border-bottom: 1px solid rgba(0,243,255,0.25);
+        }
+        .g-month {
+            color: var(--neon-blue);
+            font-size: 0.76rem;
+            font-family: monospace;
+            text-align: center;
+            border-right: 1px solid rgba(255,255,255,0.08);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .g-row-label {
+            padding: 0 10px;
+            font-size: 0.82rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            display: flex;
+            align-items: center;
+            border-bottom: 1px solid rgba(255,255,255,0.04);
+            cursor: pointer;
+        }
+        .g-row-label:hover { background: rgba(0, 243, 255, 0.08); }
+        .g-row-bg { border-bottom: 1px solid rgba(255,255,255,0.03); position: absolute; width: 100%; left: 0; }
+
+        .g-bar {
+            position: absolute;
+            height: 18px;
+            border-radius: 3px;
+            font-size: 0.7rem;
+            font-weight: bold;
+            display: flex;
+            align-items: center;
+            padding: 0 5px;
+            overflow: hidden;
+            white-space: nowrap;
+            cursor: pointer;
+            z-index: 10;
+            transform-origin: left center;
+            animation: ganttBarGrow 0.65s cubic-bezier(0.16, 1, 0.3, 1) backwards;
+            transition: filter 0.2s, box-shadow 0.2s;
+        }
+        .g-bar:hover {
+            filter: brightness(1.3);
+            z-index: 20;
+        }
+
+        .g-today-line {
+            position: absolute;
+            top: 35px;
+            bottom: 0;
+            width: 2px;
+            background: var(--neon-green);
+            box-shadow: 0 0 8px var(--neon-green);
+            z-index: 15;
+            pointer-events: none;
+        }
+        .g-today-label {
+            position: sticky;
+            top: 36px;
+            background: var(--neon-green);
+            color: #000;
+            font-size: 0.65rem;
+            font-weight: bold;
+            padding: 1px 4px;
+            border-radius: 2px;
+            transform: translateX(-50%);
+            display: inline-block;
+        }
+
+        .dep-svg {
+            position: absolute;
+            top: 0;
+            left: 0;
+            pointer-events: none;
+            z-index: 6;
+            animation: depFadeIn 0.8s ease 0.3s backwards;
+        }
+        .dep-path {
+            fill: none;
+            stroke: rgba(0, 243, 255, 0.42);
+            stroke-width: 1.4;
+            transition: stroke 0.2s, stroke-width 0.2s, opacity 0.2s;
+        }
+        .dep-path.dimmed { opacity: 0.12; }
+        .dep-path.highlighted {
+            stroke: #ff00ea;
+            stroke-width: 2.5;
+            opacity: 1;
+            filter: drop-shadow(0 0 4px #ff00ea);
+        }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: rgba(0,0,0,0.25); }
+        ::-webkit-scrollbar-thumb { background: rgba(0,243,255,0.3); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--neon-blue); }
+
+        /* =========================================================
+           PRINT STYLESHEET (CLEAN REPORT FORMAT)
+        ========================================================= */
+        .print-only-banner { display: none; }
+
+        @media print {
+            @page {
+                size: A4 landscape;
+                margin: 10mm;
+            }
+            * {
+                animation: none !important;
+                transition: none !important;
+                box-shadow: none !important;
+                text-shadow: none !important;
+                backdrop-filter: none !important;
+            }
+            body {
+                background: #ffffff !important;
+                color: #111827 !important;
+                height: auto !important;
+                overflow: visible !important;
+                display: block !important;
+            }
+            .boot-scanline,
+            .tabs,
+            .print-btn,
+            .filter-bar,
+            .section-chevron,
+            .toggle-btn,
+            .gantt-toolbar,
+            .drawer-backdrop,
+            .task-drawer {
+                display: none !important;
+            }
+            .print-only-banner {
+                display: flex !important;
+                justify-content: space-between;
+                align-items: center;
+                border-bottom: 2px solid #1e293b;
+                padding-bottom: 6px;
+                margin-bottom: 12px;
+                font-size: 0.85rem;
+                color: #334155;
+            }
+            .header {
+                background: #ffffff !important;
+                border-bottom: 2px solid #0f172a !important;
+                padding: 8px 0 !important;
+                margin-bottom: 10px;
+            }
+            .header h1 {
+                color: #0f172a !important;
+                font-size: 1.5rem !important;
+            }
+            .today-badge {
+                border: 1px solid #475569 !important;
+                color: #0f172a !important;
+                background: #f1f5f9 !important;
+            }
+            .view-container {
+                overflow: visible !important;
+                padding: 0 !important;
+                height: auto !important;
+            }
+            .view.active {
+                display: block !important;
+                height: auto !important;
+            }
+            .panel {
+                background: #ffffff !important;
+                border: 1px solid #cbd5e1 !important;
+                margin-bottom: 12px !important;
+                padding: 10px 12px !important;
+                page-break-inside: avoid;
+            }
+            .panel.collapsed .panel-body {
+                display: block !important;
+            }
+            .panel-header {
+                color: #0f172a !important;
+                border-bottom: 1px solid #94a3b8 !important;
+                font-weight: bold !important;
+            }
+            .alert-title { color: #b91c1c !important; }
+            .alert-list {
+                flex-wrap: wrap !important;
+                overflow: visible !important;
+            }
+            .alert-card {
+                background: #fff5f5 !important;
+                border: 1px solid #fecaca !important;
+                border-left: 4px solid #dc2626 !important;
+                color: #111827 !important;
+                min-width: 190px !important;
+            }
+            .dashboard-grid {
+                grid-template-columns: 220px 1fr !important;
+                page-break-inside: avoid;
+            }
+            .bar-chart {
+                max-height: none !important;
+                overflow: visible !important;
+            }
+            .bar-track {
+                background: #e2e8f0 !important;
+                border: 1px solid #cbd5e1;
+            }
+            .bar-fill {
+                background: #2563eb !important;
+            }
+            .bar-percent { color: #1e293b !important; }
+            svg text { fill: #0f172a !important; }
+            .table-container {
+                overflow: visible !important;
+            }
+            table {
+                width: 100% !important;
+                border: 1px solid #cbd5e1 !important;
+            }
+            thead {
+                display: table-header-group;
+            }
+            tr {
+                page-break-inside: avoid;
+            }
+            th {
+                background: #f1f5f9 !important;
+                color: #0f172a !important;
+                border-bottom: 2px solid #64748b !important;
+                position: static !important;
+            }
+            td {
+                color: #1e293b !important;
+                border-bottom: 1px solid #e2e8f0 !important;
+            }
+            .lvl-1 {
+                background: #f8fafc !important;
+                border-left: 3px solid #2563eb !important;
+            }
+            tr.row-overdue { background: #fef2f2 !important; }
+            tr.row-soon { background: #fffbeb !important; }
+            .pill-overdue { background: #fee2e2 !important; color: #b91c1c !important; border-color: #dc2626 !important; }
+            .pill-soon { background: #fef3c7 !important; color: #b45309 !important; border-color: #d97706 !important; }
+            .gantt-wrapper, .res-chart-scroll {
+                background: #ffffff !important;
+                border: 1px solid #cbd5e1 !important;
+                overflow: visible !important;
+            }
+            .gantt-labels {
+                background: #f8fafc !important;
+                border-right: 1px solid #94a3b8 !important;
+            }
+            .g-row-label { color: #0f172a !important; border-bottom: 1px solid #e2e8f0 !important; }
+            .g-header { background: #f1f5f9 !important; position: static !important; }
+            .g-month { color: #0f172a !important; border-right: 1px solid #cbd5e1 !important; }
+            .heatmap-table th, .heatmap-table td {
+                border: 1px solid #cbd5e1 !important;
+                color: #0f172a !important;
+            }
+            .heatmap-table th.sticky-res, .heatmap-table td.sticky-res {
+                background: #f1f5f9 !important;
+                color: #0f172a !important;
+                position: static !important;
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="boot-scanline"></div>
+
+    <div class="print-only-banner">
+        <span>PROJECT WBS MANAGEMENT REPORT</span>
+        <span id="printTimestamp">PRINTED: ----/--/--</span>
+    </div>
+
+    <div class="header animate-header">
+        <div class="header-left">
+            <h1>WBS DASHBOARD</h1>
+            <span class="today-badge" id="todayDisplay">TODAY: ----/--/--</span>
+        </div>
+        <div class="header-right">
+            <div class="tabs">
+                <button class="tab-btn active" onclick="switchTab('dashboard', this)">DETAILS &amp; CHARTS</button>
+                <button class="tab-btn" onclick="switchTab('calendar', this)">GANTT CALENDAR</button>
+                <button class="tab-btn" onclick="switchTab('resources', this)">RESOURCE WORKLOAD</button>
+            </div>
+            <button class="print-btn" onclick="triggerPrint()" title="印刷・PDF保存用に整形して出力">🖨 PRINT / PDF</button>
+        </div>
+    </div>
+
+    <!-- =========================================================
+         VIEW 1: DASHBOARD & TASK DETAILS
+    ========================================================= -->
+    <div id="view-dashboard" class="view-container view active">
+        <!-- DEADLINE ALERT PANEL (COLLAPSIBLE) -->
+        <div class="panel alert-panel animate-panel delay-1" id="panel-alerts">
+            <div class="panel-header" style="border-bottom-color: rgba(255, 42, 95, 0.3);">
+                <div class="panel-title-clickable" onclick="togglePanel('panel-alerts')">
+                    <span class="section-chevron">▼</span>
+                    <span class="alert-title">DEADLINE ALERTS</span>
+                    <span id="alertSummaryBadges"></span>
+                </div>
+                <div class="filter-bar" onclick="event.stopPropagation()">
+                    <select id="alertThreshold" class="input-glow" onchange="refreshAlertsAndTable()">
+                        <option value="7">7日以内を警告</option>
+                        <option value="14" selected>14日以内を警告</option>
+                        <option value="30">30日以内を警告</option>
+                        <option value="60">60日以内を警告</option>
+                    </select>
+                    <select id="alertDateBasis" class="input-glow" onchange="refreshAlertsAndTable()">
+                        <option value="deadline_or_end" selected>基準: 期限優先 (N/Aは終了日)</option>
+                        <option value="deadline_only">基準: 「期限」列のみ</option>
+                    </select>
+                </div>
+            </div>
+            <div class="panel-body">
+                <div class="alert-list" id="alertListContainer"></div>
+            </div>
+        </div>
+
+        <!-- TOTAL PROGRESS & PHASE PROGRESS (COLLAPSIBLE) -->
+        <div class="dashboard-grid animate-panel delay-2">
+            <div class="panel" id="panel-total-progress">
+                <div class="panel-header">
+                    <div class="panel-title-clickable" onclick="togglePanel('panel-total-progress')">
+                        <span class="section-chevron">▼</span>
+                        <span>TOTAL PROGRESS</span>
+                    </div>
+                </div>
+                <div class="panel-body">
+                    <div class="pie-container" id="pie-chart-container"></div>
+                </div>
+            </div>
+
+            <div class="panel" id="panel-phase-progress">
+                <div class="panel-header">
+                    <div class="panel-title-clickable" onclick="togglePanel('panel-phase-progress')">
+                        <span class="section-chevron">▼</span>
+                        <span>PHASE PROGRESS (Level 1)</span>
+                    </div>
+                </div>
+                <div class="panel-body">
+                    <div class="bar-chart" id="bar-chart-container"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- TASK DETAILS TABLE -->
+        <div class="panel animate-panel delay-3" style="flex:1; min-height: 260px;">
+            <div class="panel-header">
+                <span>TASK DETAILS <small style="color:var(--text-muted); font-size:0.74rem; margin-left:6px;">(行クリックで詳細・全依存チェーン表示)</small></span>
+                <div class="filter-bar">
+                    <button class="mini-btn" onclick="expandAll()">すべて展開</button>
+                    <button class="mini-btn" onclick="collapseAll()">すべて折りたたむ</button>
+                    <label style="font-size:0.78rem; color:var(--text-main); display:flex; align-items:center; gap:5px; cursor:pointer;">
+                        <input type="checkbox" id="alertOnlyCheck" onchange="applyFilter()"> アラート対象のみ
+                    </label>
+                    <input type="text" id="searchInput" class="input-glow" placeholder="タスク名 / ID 検索..." onkeyup="applyFilter()">
+                    <select id="resourceFilter" class="input-glow" onchange="applyFilter()">
+                        <option value="">すべてのリソース</option>
+                    </select>
+                </div>
+            </div>
+            <div class="table-container">
+                <table id="wbs-table">
+                    <thead>
+                        <tr>
+                            <th style="width: 65px;">ID</th>
+                            <th>タスク名</th>
+                            <th style="width: 140px;">達成率</th>
+                            <th style="width: 120px;">期間 / 工数</th>
+                            <th style="width: 105px;">開始日</th>
+                            <th style="width: 105px;">終了日</th>
+                            <th style="width: 105px;">期限</th>
+                            <th style="width: 130px;">リソース</th>
+                            <th style="width: 110px;">先行 / 後続</th>
+                        </tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- =========================================================
+         VIEW 2: CALENDAR (GANTT) VIEW
+    ========================================================= -->
+    <div id="view-calendar" class="view-container view">
+        <div class="gantt-toolbar animate-panel delay-1">
+            <div class="filter-bar">
+                <button class="mini-btn" onclick="expandAll()">すべて展開</button>
+                <button class="mini-btn" onclick="collapseAll()">すべて折りたたむ</button>
+                <button class="mini-btn active" id="toggleDepBtn" onclick="toggleDepLines()">依存関係線: ON</button>
+                <select id="ganttZoom" class="input-glow" onchange="renderGantt()">
+                    <option value="3">表示倍率: 広域 (3px/日)</option>
+                    <option value="5" selected>表示倍率: 標準 (5px/日)</option>
+                    <option value="9">表示倍率: 詳細 (9px/日)</option>
+                </select>
+            </div>
+            <div class="gantt-legend">
+                <span><i class="legend-dot" style="background:var(--neon-purple);"></i>Level 1</span>
+                <span><i class="legend-dot" style="background:var(--neon-blue);"></i>通常タスク</span>
+                <span><i class="legend-dot" style="background:var(--neon-amber);"></i>期限間近</span>
+                <span><i class="legend-dot" style="background:var(--neon-red);"></i>期限超過</span>
+                <span><i class="legend-dot" style="background:var(--neon-green);"></i>TODAY</span>
+            </div>
+        </div>
+        <div class="gantt-wrapper animate-panel delay-2">
+            <div class="gantt-labels" id="gantt-labels"></div>
+            <div class="gantt-timeline-container" id="gantt-scroll" onscroll="syncScroll()">
+                <div class="gantt-timeline" id="gantt-timeline"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- =========================================================
+         VIEW 3: RESOURCE WORKLOAD (DAILY HOURS ANALYTICS)
+    ========================================================= -->
+    <div id="view-resources" class="view-container view">
+        <div class="panel animate-panel delay-1" style="margin-bottom: 14px;">
+            <div class="panel-header">
+                <span>RESOURCE DAILY WORKLOAD ANALYTICS <small style="color:var(--text-muted); font-size:0.74rem; margin-left:6px;">(末端タスクの作業時間を期間内の稼働日に日割り算出)</small></span>
+                <div class="filter-bar">
+                    <select id="resChartSelect" class="input-glow" onchange="renderResourceView()">
+                        <option value="__ALL__">全リソース合計 / 比較</option>
+                    </select>
+                    <select id="resDayMode" class="input-glow" onchange="renderResourceView()">
+                        <option value="weekdays" selected>配分: 営業日按分 (土日除く)</option>
+                        <option value="all_days">配分: カレンダー全日程按分</option>
+                    </select>
+                    <label style="font-size:0.78rem; color:var(--text-main); display:flex; align-items:center; gap:6px; background:rgba(0,0,0,0.35); padding:3px 8px; border-radius:4px; border:1px solid rgba(255,42,95,0.35);">
+                        <span style="color:#ff80a0;">過負荷ライン:</span>
+                        <input type="number" id="resOverloadLimit" class="input-glow" value="8" min="0.5" max="24" step="0.5"
+                               style="width:68px; text-align:right; padding:3px 6px;"
+                               oninput="onOverloadLimitChange()" onchange="onOverloadLimitChange()">
+                        <span style="color:var(--text-muted);">h/日</span>
+                    </label>
+                </div>
+            </div>
+            <div class="res-summary-cards" id="resSummaryCards"></div>
+            <div class="res-chart-scroll" id="resDailyBarSvgContainer"></div>
+        </div>
+
+        <div class="panel animate-panel delay-2" style="flex:1; min-height: 220px;">
+            <div class="panel-header">
+                <span>DAILY WORKLOAD HEATMAP MATRIX (時間 / 日) <small style="color:var(--text-muted); font-size:0.74rem; margin-left:6px;">(セルクリックで円グラフ＆タスク内訳を表示)</small></span>
+                <div class="gantt-legend">
+                    <span><i class="legend-dot" style="background:rgba(0,243,255,0.25);"></i>低負荷</span>
+                    <span><i class="legend-dot" style="background:rgba(0,243,255,0.5);"></i>適正</span>
+                    <span><i class="legend-dot" style="background:rgba(255,170,0,0.55);"></i>高負荷</span>
+                    <span><i class="legend-dot" style="background:rgba(255,42,95,0.7);"></i>基準超過</span>
+                </div>
+            </div>
+
+            <!-- GRAPHICAL DAY BREAKDOWN PANEL (PIE CHART + TASK LIST) -->
+            <div id="resCellDetailPanel" class="day-breakdown-panel"></div>
+
+            <div class="table-container" id="resHeatmapContainer"></div>
+        </div>
+    </div>
+
+    <!-- =========================================================
+         GRAPHICAL TASK DETAIL HUD DRAWER
+    ========================================================= -->
+    <div class="drawer-backdrop" id="drawerBackdrop" onclick="closeTaskDetail()"></div>
+    <aside class="task-drawer" id="taskDrawer">
+        <div class="drawer-header">
+            <div style="flex:1; min-width:0;">
+                <div class="drawer-breadcrumbs" id="drawerBreadcrumbs"></div>
+                <div class="drawer-title-row">
+                    <span class="drawer-id-tag" id="drawerTaskId">ID: -</span>
+                    <span id="drawerAlertBadge"></span>
+                </div>
+                <div class="drawer-task-name" id="drawerTaskName" style="margin-top:6px;">タスクを選択してください</div>
+            </div>
+            <button class="drawer-close-btn" onclick="closeTaskDetail()" title="閉じる (ESC)">✕</button>
+        </div>
+        <div class="drawer-body" id="drawerBody"></div>
+    </aside>
+
+    <script>
+        let tasks = __WBS_JSON_DATA__;
+        let collapsedNodes = new Set();
+        let isFiltering = false;
+        let showDepLines = true;
+        let selectedTaskId = null;
+        let selectedHeatmapCell = null; // { resName, dateKey }
+
+        const PIE_PALETTE = [
+            '#00f3ff',
+            '#bc13fe',
+            '#00ff66',
+            '#ffaa00',
+            '#ff2a5f',
+            '#38bdf8',
+            '#f472b6',
+            '#a3e635'
+        ];
+
+        // 今日の日付（00:00:00基準）
+        const now = new Date();
+        const todayDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        const todayStr = `${todayDate.getFullYear()}-${String(todayDate.getMonth() + 1).padStart(2, '0')}-${String(todayDate.getDate()).padStart(2, '0')}`;
+
+        function parseLocalDate(isoStr) {
+            if (!isoStr) return null;
+            const parts = isoStr.split('-');
+            if (parts.length !== 3) return null;
+            return new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10));
+        }
+
+        function formatDateKey(d) {
+            return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        }
+
+        function getDayOfWeekJa(isoStr) {
+            const d = parseLocalDate(isoStr);
+            if (!d) return '';
+            return ['日', '月', '火', '水', '木', '金', '土'][d.getDay()];
+        }
+
+        function escapeHtml(str) {
+            if (!str) return '';
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
+
+        function togglePanel(panelId) {
+            const panel = document.getElementById(panelId);
+            if (panel) panel.classList.toggle('collapsed');
+        }
+
+        function triggerPrint() {
+            const ts = new Date();
+            const tsStr = `${ts.getFullYear()}-${String(ts.getMonth() + 1).padStart(2, '0')}-${String(ts.getDate()).padStart(2, '0')} ${String(ts.getHours()).padStart(2, '0')}:${String(ts.getMinutes()).padStart(2, '0')}`;
+            document.getElementById('printTimestamp').textContent = `PRINTED: ${tsStr}`;
+            window.print();
+        }
+
+        function replayViewAnimations(viewEl) {
+            if (!viewEl) return;
+            const animatedEls = viewEl.querySelectorAll('.animate-panel');
+            animatedEls.forEach(el => {
+                el.style.animation = 'none';
+                void el.offsetWidth;
+                el.style.animation = '';
+            });
+        }
+
+        function initData() {
+            document.getElementById('todayDisplay').textContent = `TODAY: ${todayStr}`;
+
+            // PHASE PROGRESS: Level 1タスクの進捗を配下タスクの平均から自動計算
+            const topLvlStats = {};
+            tasks.forEach(t => {
+                if (t.level === 1) topLvlStats[t.id] = { sum: 0, count: 0 };
+            });
+
+            tasks.forEach(t => {
+                if (t.level > 1 && t.top_parent_id && topLvlStats[t.top_parent_id]) {
+                    topLvlStats[t.top_parent_id].sum += parseFloat(t.progress || 0);
+                    topLvlStats[t.top_parent_id].count++;
+                }
+            });
+
+            tasks.forEach(t => {
+                if (t.level === 1 && topLvlStats[t.id].count > 0) {
+                    t.progress = topLvlStats[t.id].sum / topLvlStats[t.id].count;
+                }
+            });
+
+            // リソースフィルター選択肢
+            const resources = [...new Set(tasks.map(t => t.resource).filter(r => r))];
+            const resSelect = document.getElementById('resourceFilter');
+            const resChartSelect = document.getElementById('resChartSelect');
+            resources.forEach(r => {
+                const opt = document.createElement('option');
+                opt.value = r;
+                opt.textContent = r;
+                resSelect.appendChild(opt);
+
+                const opt2 = document.createElement('option');
+                opt2.value = r;
+                opt2.textContent = r;
+                resChartSelect.appendChild(opt2);
+            });
+        }
+
+        function getAlertInfo(t) {
+            if (parseFloat(t.progress || 0) >= 0.999) return null;
+
+            const threshold = parseInt(document.getElementById('alertThreshold').value, 10);
+            const basis = document.getElementById('alertDateBasis').value;
+
+            let targetStr = '';
+            let basisLabel = '';
+            if (basis === 'deadline_only') {
+                targetStr = t.deadline;
+                basisLabel = '期限';
+            } else {
+                if (t.deadline) {
+                    targetStr = t.deadline;
+                    basisLabel = '期限';
+                } else if (t.end) {
+                    targetStr = t.end;
+                    basisLabel = '終了日';
+                }
+            }
+
+            const targetDate = parseLocalDate(targetStr);
+            if (!targetDate) return null;
+
+            const diffDays = Math.round((targetDate - todayDate) / (1000 * 60 * 60 * 24));
+            if (diffDays < 0) {
+                return { type: 'overdue', diffDays, targetStr, basisLabel, label: `${Math.abs(diffDays)}日超過` };
+            } else if (diffDays <= threshold) {
+                const dayText = diffDays === 0 ? '本日期限' : `あと${diffDays}日`;
+                return { type: 'soon', diffDays, targetStr, basisLabel, label: dayText };
+            }
+            return null;
+        }
+
+        function renderAlerts() {
+            const container = document.getElementById('alertListContainer');
+            const summaryContainer = document.getElementById('alertSummaryBadges');
+
+            const alerted = [];
+            tasks.forEach(t => {
+                const info = getAlertInfo(t);
+                if (info) alerted.push({ task: t, info });
+            });
+
+            alerted.sort((a, b) => a.info.diffDays - b.info.diffDays);
+
+            const overdueCount = alerted.filter(a => a.info.type === 'overdue').length;
+            const soonCount = alerted.filter(a => a.info.type === 'soon').length;
+
+            if (alerted.length === 0) {
+                summaryContainer.innerHTML = `<span class="alert-count-badge badge-ok">ALERT: 0件 (問題なし)</span>`;
+                container.innerHTML = `<div style="font-size:0.82rem; color:var(--text-muted); padding:4px 0;">現在、期限超過または指定日数以内に期限を迎える未完了タスクはありません。</div>`;
+                return;
+            }
+
+            summaryContainer.innerHTML = `
+                <span class="alert-count-badge badge-overdue">期限超過: ${overdueCount}件</span>
+                <span class="alert-count-badge badge-soon">期限間近: ${soonCount}件</span>
+            `;
+
+            let html = '';
+            alerted.forEach(({ task, info }) => {
+                const isOverdue = info.type === 'overdue';
+                const cardClass = isOverdue ? 'alert-card overdue' : 'alert-card';
+                const statusColor = isOverdue ? 'var(--neon-red)' : 'var(--neon-amber)';
+                const prog = (parseFloat(task.progress || 0) * 100).toFixed(0);
+
+                html += `
+                    <div class="${cardClass}" onclick="openTaskDetail('${task.id}')">
+                        <div class="alert-card-top">
+                            <span style="color:var(--text-muted);">ID: ${escapeHtml(task.id)}</span>
+                            <span style="color:${statusColor}; font-weight:bold;">[${info.label}]</span>
+                        </div>
+                        <div class="alert-card-name" title="${escapeHtml(task.name)}">${escapeHtml(task.name)}</div>
+                        <div class="alert-card-meta">
+                            <span>${info.basisLabel}: ${info.targetStr}</span>
+                            <span>進捗: ${prog}%</span>
+                        </div>
+                    </div>
+                `;
+            });
+            container.innerHTML = html;
+        }
+
+        function refreshAlertsAndTable() {
+            renderAlerts();
+            renderTable();
+            if (document.getElementById('view-calendar').classList.contains('active')) {
+                renderGantt();
+            }
+            if (selectedTaskId) {
+                openTaskDetail(selectedTaskId, false);
+            }
+        }
+
+        function switchTab(viewId, btnEl) {
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+
+            btnEl.classList.add('active');
+            const targetView = document.getElementById('view-' + viewId);
+            targetView.classList.add('active');
+            replayViewAnimations(targetView);
+
+            if (viewId === 'dashboard') {
+                renderDashboard();
+            } else if (viewId === 'calendar') {
+                renderGantt();
+            } else if (viewId === 'resources') {
+                renderResourceView();
+            }
+        }
+
+        function toggleCollapse(id, e) {
+            if (e) e.stopPropagation();
+            if (isFiltering && document.getElementById('view-dashboard').classList.contains('active')) return;
+            if (collapsedNodes.has(id)) collapsedNodes.delete(id);
+            else collapsedNodes.add(id);
+
+            renderTable();
+            if (document.getElementById('view-calendar').classList.contains('active')) {
+                renderGantt();
+            }
+        }
+
+        function expandAll() {
+            collapsedNodes.clear();
+            renderTable();
+            if (document.getElementById('view-calendar').classList.contains('active')) {
+                renderGantt();
+            }
+        }
+
+        function collapseAll() {
+            tasks.forEach(t => {
+                if (t.has_children) collapsedNodes.add(t.id);
+            });
+            renderTable();
+            if (document.getElementById('view-calendar').classList.contains('active')) {
+                renderGantt();
+            }
+        }
+
+        function toggleDepLines() {
+            showDepLines = !showDepLines;
+            const btn = document.getElementById('toggleDepBtn');
+            btn.textContent = `依存関係線: ${showDepLines ? 'ON' : 'OFF'}`;
+            btn.classList.toggle('active', showDepLines);
+            renderGantt();
+        }
+
+        function applyFilter() {
+            const txt = document.getElementById('searchInput').value.toLowerCase();
+            const res = document.getElementById('resourceFilter').value;
+            const alertOnly = document.getElementById('alertOnlyCheck').checked;
+            isFiltering = (txt !== '' || res !== '' || alertOnly);
+            renderTable();
+        }
+
+        function isTaskHiddenByCollapse(t) {
+            let curr = tasks.find(x => x.id === t.parent_id);
+            while (curr) {
+                if (collapsedNodes.has(curr.id)) return true;
+                curr = tasks.find(x => x.id === curr.parent_id);
+            }
+            return false;
+        }
+
+        function renderDashboard() {
+            const lvl1Tasks = tasks.filter(t => t.level === 1);
+            const avgProgress = lvl1Tasks.length
+                ? (lvl1Tasks.reduce((s, t) => s + parseFloat(t.progress || 0), 0) / lvl1Tasks.length) * 100
+                : 0;
+
+            const radius = 56;
+            const circumference = 2 * Math.PI * radius;
+            const targetOffset = circumference - (avgProgress / 100) * circumference;
+
+            document.getElementById('pie-chart-container').innerHTML = `
+                <svg width="146" height="146" viewBox="0 0 140 140">
+                    <circle cx="70" cy="70" r="${radius}" fill="none" stroke="rgba(255,255,255,0.06)" stroke-width="12" />
+                    <circle id="totalPieArc" cx="70" cy="70" r="${radius}" fill="none" stroke="#00f3ff" stroke-width="12"
+                            stroke-dasharray="${circumference}" stroke-dashoffset="${circumference}"
+                            stroke-linecap="round" transform="rotate(-90 70 70)"
+                            style="filter: drop-shadow(0 0 8px #00f3ff); transition: stroke-dashoffset 1.2s cubic-bezier(0.16, 1, 0.3, 1);" />
+                    <text id="totalPieText" x="70" y="77" text-anchor="middle" fill="#e2e8f0" font-size="22" font-family="monospace" font-weight="bold">0.0%</text>
+                </svg>
+            `;
+
+            let html = '';
+            lvl1Tasks.forEach((t, idx) => {
+                const p = (parseFloat(t.progress || 0) * 100).toFixed(0);
+                html += `
+                    <div class="bar-item" onclick="openTaskDetail('${t.id}')">
+                        <div class="bar-label" title="${escapeHtml(t.name)}">${escapeHtml(t.name)}</div>
+                        <div class="bar-track">
+                            <div class="bar-fill" id="phaseBar-${idx}" data-target="${p}" style="width: 0%"></div>
+                        </div>
+                        <div class="bar-percent" id="phasePct-${idx}" data-target="${p}">0%</div>
+                    </div>`;
+            });
+            document.getElementById('bar-chart-container').innerHTML = html;
+
+            requestAnimationFrame(() => {
+                setTimeout(() => {
+                    const arc = document.getElementById('totalPieArc');
+                    if (arc) arc.style.strokeDashoffset = targetOffset;
+
+                    animateNumber('totalPieText', 0, avgProgress, 1000, 1, '%');
+
+                    lvl1Tasks.forEach((t, idx) => {
+                        const p = parseFloat((parseFloat(t.progress || 0) * 100).toFixed(0));
+                        const bar = document.getElementById(`phaseBar-${idx}`);
+                        if (bar) bar.style.width = `${p}%`;
+                        animateNumber(`phasePct-${idx}`, 0, p, 1000, 0, '%');
+                    });
+                }, 100);
+            });
+        }
+
+        function animateNumber(elementId, startVal, endVal, durationMs, decimals, suffix) {
+            const el = document.getElementById(elementId);
+            if (!el) return;
+            const startTime = performance.now();
+            function tick(nowTime) {
+                const elapsed = nowTime - startTime;
+                const progress = Math.min(1, elapsed / durationMs);
+                const eased = 1 - Math.pow(1 - progress, 3);
+                const current = startVal + (endVal - startVal) * eased;
+                el.textContent = `${current.toFixed(decimals)}${suffix}`;
+                if (progress < 1) requestAnimationFrame(tick);
+            }
+            requestAnimationFrame(tick);
+        }
+
+        function renderTable() {
+            const tbody = document.querySelector('#wbs-table tbody');
+            const txt = document.getElementById('searchInput').value.toLowerCase();
+            const res = document.getElementById('resourceFilter').value;
+            const alertOnly = document.getElementById('alertOnlyCheck').checked;
+
+            let visibleSet = new Set();
+            if (isFiltering) {
+                tasks.forEach(t => {
+                    let match = true;
+                    if (txt && !t.name.toLowerCase().includes(txt) && !String(t.id).includes(txt)) match = false;
+                    if (res && t.resource !== res) match = false;
+                    if (alertOnly && !getAlertInfo(t)) match = false;
+
+                    if (match) {
+                        visibleSet.add(t.id);
+                        let curr = tasks.find(x => x.id === t.parent_id);
+                        while (curr) {
+                            visibleSet.add(curr.id);
+                            curr = tasks.find(x => x.id === curr.parent_id);
+                        }
+                    }
+                });
+            }
+
+            let html = '';
+            tasks.forEach(t => {
+                if (isFiltering) {
+                    if (!visibleSet.has(t.id)) return;
+                } else {
+                    if (isTaskHiddenByCollapse(t)) return;
+                }
+
+                const pad = (t.level - 1) * 18;
+                const prog = (parseFloat(t.progress || 0) * 100).toFixed(0);
+                const alertInfo = getAlertInfo(t);
+
+                let rowClasses = [];
+                if (t.level === 1) rowClasses.push('lvl-1');
+                if (alertInfo) rowClasses.push(alertInfo.type === 'overdue' ? 'row-overdue' : 'row-soon');
+                if (selectedTaskId === t.id) rowClasses.push('selected-row');
+
+                let toggleIcon = '<span style="display:inline-block; width:22px;"></span>';
+                if (t.has_children) {
+                    const icon = collapsedNodes.has(t.id) ? '+' : '-';
+                    toggleIcon = `<span class="toggle-btn" onclick="toggleCollapse('${t.id}', event)">[${icon}]</span>`;
+                }
+
+                let alertPill = '';
+                if (alertInfo) {
+                    const pillClass = alertInfo.type === 'overdue' ? 'pill-overdue' : 'pill-soon';
+                    alertPill = `<span class="status-pill ${pillClass}">${alertInfo.label}</span>`;
+                }
+
+                const predText = t.predecessors.length ? `先:${t.predecessors.join(',')}` : '';
+                const succText = t.successors.length ? `後:${t.successors.join(',')}` : '';
+                const depDisplay = [predText, succText].filter(Boolean).join(' / ') || '-';
+
+                html += `
+                    <tr id="task-row-${t.id}" class="${rowClasses.join(' ')}" onclick="openTaskDetail('${t.id}')">
+                        <td style="color: var(--text-muted); font-family:monospace;">${escapeHtml(t.id)}</td>
+                        <td style="padding-left: ${pad + 8}px;">
+                            ${toggleIcon}
+                            ${escapeHtml(t.name)}
+                            ${alertPill}
+                        </td>
+                        <td>
+                            <div style="display:flex; align-items:center; gap:8px;">
+                                <div style="width:55px; background:rgba(255,255,255,0.1); height:6px; border-radius:3px;">
+                                    <div style="height:100%; width:${prog}%; background:var(--neon-green); box-shadow:0 0 5px var(--neon-green); border-radius:3px;"></div>
+                                </div>
+                                <span style="font-family:monospace; font-size:0.8rem;">${prog}%</span>
+                            </div>
+                        </td>
+                        <td style="font-size:0.8rem; color:var(--text-muted);">${escapeHtml(t.duration) || '-'} / ${escapeHtml(t.work_hours) || '-'}</td>
+                        <td style="font-family:monospace;">${t.start || '-'}</td>
+                        <td style="font-family:monospace;">${t.end || '-'}</td>
+                        <td style="font-family:monospace; color:${t.deadline ? 'var(--text-main)' : 'var(--text-muted)'};">${t.deadline || 'N/A'}</td>
+                        <td>${escapeHtml(t.resource) || '-'}</td>
+                        <td style="font-size:0.78rem; color:var(--text-muted); font-family:monospace;">${escapeHtml(depDisplay)}</td>
+                    </tr>
+                `;
+            });
+            tbody.innerHTML = html;
+        }
+
+        /* =========================================================
+           GRAPHICAL TASK DETAIL HUD & FULL-CHAIN DEPENDENCY GRAPH
+        ========================================================= */
+        function openTaskDetail(taskId, scrollToRow = true) {
+            const task = tasks.find(t => String(t.id) === String(taskId));
+            if (!task) return;
+
+            selectedTaskId = task.id;
+
+            let pCursor = tasks.find(x => x.id === task.parent_id);
+            while (pCursor) {
+                collapsedNodes.delete(pCursor.id);
+                pCursor = tasks.find(x => x.id === pCursor.parent_id);
+            }
+            renderTable();
+
+            if (scrollToRow) {
+                const rowEl = document.getElementById(`task-row-${task.id}`);
+                if (rowEl) rowEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            }
+
+            const ancestors = [];
+            let curr = tasks.find(x => x.id === task.parent_id);
+            while (curr) {
+                ancestors.unshift(curr);
+                curr = tasks.find(x => x.id === curr.parent_id);
+            }
+            const crumbHtml = ancestors.length
+                ? ancestors.map(a => `<span class="crumb-link" onclick="openTaskDetail('${a.id}')">[${escapeHtml(a.id)}] ${escapeHtml(a.name)}</span>`).join(' <span>/</span> ')
+                : '<span>ROOT LEVEL (Outline 1)</span>';
+            document.getElementById('drawerBreadcrumbs').innerHTML = crumbHtml;
+
+            document.getElementById('drawerTaskId').textContent = `ID: ${task.id} | LVL: ${task.level}`;
+            document.getElementById('drawerTaskName').textContent = task.name;
+
+            const alertInfo = getAlertInfo(task);
+            const progFloat = parseFloat(task.progress || 0);
+            const progPct = (progFloat * 100).toFixed(0);
+
+            let statusBadgeHtml = '';
+            if (progFloat >= 0.999) {
+                statusBadgeHtml = `<span class="alert-count-badge badge-ok">COMPLETED (100%)</span>`;
+            } else if (alertInfo) {
+                const cls = alertInfo.type === 'overdue' ? 'badge-overdue' : 'badge-soon';
+                statusBadgeHtml = `<span class="alert-count-badge ${cls}">${alertInfo.label}</span>`;
+            } else {
+                statusBadgeHtml = `<span class="alert-count-badge" style="border:1px solid var(--neon-blue); color:var(--neon-blue); background:rgba(0,243,255,0.1);">IN PROGRESS</span>`;
+            }
+            document.getElementById('drawerAlertBadge').innerHTML = statusBadgeHtml;
+
+            let elapsedPct = 0;
+            let scheduleNote = '日程データ不足';
+            const sDate = parseLocalDate(task.start);
+            const eDate = parseLocalDate(task.end);
+            if (sDate && eDate) {
+                const totalSpan = Math.max(1, (eDate - sDate) / (1000 * 60 * 60 * 24));
+                const elapsedSpan = (todayDate - sDate) / (1000 * 60 * 60 * 24);
+                elapsedPct = Math.max(0, Math.min(100, (elapsedSpan / totalSpan) * 100));
+                if (todayDate < sDate) {
+                    const untilStart = Math.round((sDate - todayDate) / (1000 * 60 * 60 * 24));
+                    scheduleNote = `開始まであと ${untilStart}日`;
+                } else if (todayDate > eDate) {
+                    const pastEnd = Math.round((todayDate - eDate) / (1000 * 60 * 60 * 24));
+                    scheduleNote = `終了予定日から ${pastEnd}日経過`;
+                } else {
+                    scheduleNote = `期間内の ${elapsedPct.toFixed(0)}% 経過`;
+                }
+            }
+
+            const r = 46;
+            const c = 2 * Math.PI * r;
+            const dashOffset = c - (Math.min(100, progFloat * 100) / 100) * c;
+            const gaugeColor = progFloat >= 0.999 ? 'var(--neon-green)' : (alertInfo && alertInfo.type === 'overdue' ? 'var(--neon-red)' : 'var(--neon-blue)');
+
+            const chainResult = buildFullChainDependencySvg(task);
+
+            const subTasks = [];
+            const startIdx = tasks.findIndex(t => t.id === task.id);
+            if (startIdx >= 0) {
+                for (let i = startIdx + 1; i < tasks.length; i++) {
+                    if (tasks[i].level <= task.level) break;
+                    subTasks.push(tasks[i]);
+                }
+            }
+
+            let subTasksHtml = '';
+            if (subTasks.length > 0) {
+                const itemsHtml = subTasks.map(st => {
+                    const sp = (parseFloat(st.progress || 0) * 100).toFixed(0);
+                    const indent = (st.level - task.level - 1) * 12;
+                    return `
+                        <div class="subtask-mini-item" style="margin-left:${indent}px;" onclick="openTaskDetail('${st.id}')">
+                            <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+                                <span style="color:var(--text-muted); font-family:monospace; margin-right:6px;">#${escapeHtml(st.id)}</span>
+                                <span>${escapeHtml(st.name)}</span>
+                            </div>
+                            <div style="display:flex; align-items:center; gap:6px; flex-shrink:0;">
+                                <div style="width:45px; height:5px; background:rgba(255,255,255,0.1); border-radius:3px;">
+                                    <div style="width:${sp}%; height:100%; background:var(--neon-blue); border-radius:3px;"></div>
+                                </div>
+                                <span style="font-family:monospace; font-size:0.75rem; color:var(--neon-blue);">${sp}%</span>
+                            </div>
+                        </div>`;
+                }).join('');
+
+                subTasksHtml = `
+                    <div class="hud-card">
+                        <div class="hud-card-title">
+                            <span>SUB-TASKS HIERARCHY (${subTasks.length}件)</span>
+                            <span style="color:var(--text-muted); font-size:0.7rem;">クリックで詳細へ移動</span>
+                        </div>
+                        <div class="subtask-mini-list">${itemsHtml}</div>
+                    </div>`;
+            }
+
+            document.getElementById('drawerBody').innerHTML = `
+                <div class="hud-card">
+                    <div class="hud-card-title">
+                        <span>PROGRESS &amp; SCHEDULE TELEMETRY</span>
+                        <span style="color:var(--text-muted); font-size:0.72rem;">${scheduleNote}</span>
+                    </div>
+                    <div class="progress-hud-grid">
+                        <div style="display:flex; flex-direction:column; align-items:center;">
+                            <svg width="116" height="116" viewBox="0 0 116 116">
+                                <circle cx="58" cy="58" r="${r}" fill="none" stroke="rgba(255,255,255,0.07)" stroke-width="10" />
+                                <circle cx="58" cy="58" r="${r}" fill="none" stroke="${gaugeColor}" stroke-width="10"
+                                        stroke-dasharray="${c}" stroke-dashoffset="${dashOffset}"
+                                        stroke-linecap="round" transform="rotate(-90 58 58)"
+                                        style="filter: drop-shadow(0 0 6px ${gaugeColor});" />
+                                <text x="58" y="63" text-anchor="middle" fill="#fff" font-size="20" font-family="monospace" font-weight="bold">${progPct}%</text>
+                            </svg>
+                            <span style="font-size:0.7rem; color:var(--text-muted); margin-top:2px;">ACTUAL PROGRESS</span>
+                        </div>
+
+                        <div class="dual-bar-group">
+                            <div class="dual-bar-row">
+                                <div class="dual-bar-label">
+                                    <span style="color:var(--neon-green);">実績達成率 (Actual)</span>
+                                    <span style="font-family:monospace; font-weight:bold;">${progPct}%</span>
+                                </div>
+                                <div class="dual-bar-track">
+                                    <div class="dual-bar-fill-actual" style="width:${progPct}%;"></div>
+                                </div>
+                            </div>
+                            <div class="dual-bar-row">
+                                <div class="dual-bar-label">
+                                    <span style="color:var(--neon-blue);">日程経過率 (Time Elapsed)</span>
+                                    <span style="font-family:monospace;">${elapsedPct.toFixed(0)}%</span>
+                                </div>
+                                <div class="dual-bar-track">
+                                    <div class="dual-bar-fill-time" style="width:${elapsedPct.toFixed(0)}%;"></div>
+                                </div>
+                            </div>
+                            <div style="font-size:0.74rem; color:var(--text-muted); display:flex; justify-content:space-between; border-top:1px solid rgba(255,255,255,0.06); padding-top:6px;">
+                                <span>開始: <strong style="color:var(--text-main);">${task.start || '-'}</strong></span>
+                                <span>終了: <strong style="color:var(--text-main);">${task.end || '-'}</strong></span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="hud-card">
+                    <div class="hud-card-title"><span>TASK SPECIFICATIONS</span></div>
+                    <div class="telemetry-grid">
+                        <div class="tele-box">
+                            <div class="tele-label">リソース (主担当)</div>
+                            <div class="tele-val" style="color:var(--neon-blue);">${escapeHtml(task.resource) || '未設定'}</div>
+                        </div>
+                        <div class="tele-box">
+                            <div class="tele-label">関係者 (サポート)</div>
+                            <div class="tele-val">${escapeHtml(task.stakeholder) || '-'}</div>
+                        </div>
+                        <div class="tele-box">
+                            <div class="tele-label">期限 (Deadline)</div>
+                            <div class="tele-val" style="color:${alertInfo ? 'var(--neon-red)' : 'var(--text-main)'};">${task.deadline || 'N/A'}</div>
+                        </div>
+                        <div class="tele-box">
+                            <div class="tele-label">作業時間</div>
+                            <div class="tele-val">${escapeHtml(task.work_hours) || '-'}</div>
+                        </div>
+                        <div class="tele-box">
+                            <div class="tele-label">期間</div>
+                            <div class="tele-val">${escapeHtml(task.duration) || '-'}</div>
+                        </div>
+                        <div class="tele-box">
+                            <div class="tele-label">全連鎖ノード数</div>
+                            <div class="tele-val">上流:${chainResult.upCount} / 下流:${chainResult.downCount}</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="hud-card">
+                    <div class="hud-card-title">
+                        <span>DEPENDENCY FLOW GRAPH (全連鎖ネットワーク)</span>
+                        <span style="color:var(--text-muted); font-size:0.7rem;">該当タスクを中央強調 / クリックで移動</span>
+                    </div>
+                    <div class="dep-diagram-wrap" id="depDiagramWrap">
+                        ${chainResult.svgHtml}
+                    </div>
+                </div>
+
+                ${subTasksHtml}
+            `;
+
+            document.getElementById('drawerBackdrop').classList.add('open');
+            document.getElementById('taskDrawer').classList.add('open');
+
+            setTimeout(() => {
+                const wrap = document.getElementById('depDiagramWrap');
+                if (wrap && chainResult.targetCenterX !== null) {
+                    wrap.scrollLeft = Math.max(0, chainResult.targetCenterX - wrap.clientWidth / 2);
+                }
+            }, 30);
+        }
+
+        function buildFullChainDependencySvg(currentTask) {
+            const taskMap = {};
+            const predsMap = {};
+            const succsMap = {};
+
+            tasks.forEach(t => {
+                taskMap[t.id] = t;
+                predsMap[t.id] = new Set();
+                succsMap[t.id] = new Set();
+            });
+
+            tasks.forEach(t => {
+                (t.predecessors || []).forEach(pid => {
+                    if (!predsMap[t.id]) predsMap[t.id] = new Set();
+                    if (!succsMap[pid]) succsMap[pid] = new Set();
+                    predsMap[t.id].add(pid);
+                    succsMap[pid].add(t.id);
+                });
+                (t.successors || []).forEach(sid => {
+                    if (!succsMap[t.id]) succsMap[t.id] = new Set();
+                    if (!predsMap[sid]) predsMap[sid] = new Set();
+                    succsMap[t.id].add(sid);
+                    predsMap[sid].add(t.id);
+                });
+            });
+
+            const directPreds = predsMap[currentTask.id] || new Set();
+            const directSuccs = succsMap[currentTask.id] || new Set();
+
+            if (directPreds.size === 0 && directSuccs.size === 0) {
+                return {
+                    upCount: 0,
+                    downCount: 0,
+                    targetCenterX: null,
+                    svgHtml: `<div style="padding:18px; text-align:center; color:var(--text-muted); font-size:0.8rem;">このタスクに紐づく先行タスク・後続タスクはありません。</div>`
+                };
+            }
+
+            const layerMap = { [currentTask.id]: 0 };
+            const upVisited = new Set([currentTask.id]);
+            const upQueue = [{ id: currentTask.id, dist: 0 }];
+
+            while (upQueue.length > 0) {
+                const { id, dist } = upQueue.shift();
+                const parents = predsMap[id] || new Set();
+                parents.forEach(pid => {
+                    const nextDist = dist - 1;
+                    if (!upVisited.has(pid)) {
+                        upVisited.add(pid);
+                        layerMap[pid] = nextDist;
+                        upQueue.push({ id: pid, dist: nextDist });
+                    } else if (layerMap[pid] !== undefined && layerMap[pid] < 0 && nextDist < layerMap[pid] && upVisited.size < 200) {
+                        if (nextDist >= -20) {
+                            layerMap[pid] = nextDist;
+                            upQueue.push({ id: pid, dist: nextDist });
+                        }
+                    }
+                });
+            }
+
+            const downVisited = new Set([currentTask.id]);
+            const downQueue = [{ id: currentTask.id, dist: 0 }];
+
+            while (downQueue.length > 0) {
+                const { id, dist } = downQueue.shift();
+                const children = succsMap[id] || new Set();
+                children.forEach(sid => {
+                    const nextDist = dist + 1;
+                    if (!downVisited.has(sid)) {
+                        downVisited.add(sid);
+                        if (layerMap[sid] === undefined) {
+                            layerMap[sid] = nextDist;
+                        }
+                        downQueue.push({ id: sid, dist: nextDist });
+                    } else if (layerMap[sid] !== undefined && layerMap[sid] > 0 && nextDist > layerMap[sid] && nextDist <= 20) {
+                        layerMap[sid] = nextDist;
+                        downQueue.push({ id: sid, dist: nextDist });
+                    }
+                });
+            }
+
+            const allChainIds = Object.keys(layerMap);
+            const layers = [...new Set(Object.values(layerMap))].sort((a, b) => a - b);
+
+            const nodesByLayer = {};
+            layers.forEach(l => { nodesByLayer[l] = []; });
+            allChainIds.forEach(id => {
+                nodesByLayer[layerMap[id]].push(id);
+            });
+
+            const stdW = 148;
+            const stdH = 44;
+            const curW = 178;
+            const curH = 58;
+            const colGap = 46;
+            const rowGap = 14;
+            const padX = 16;
+            const padY = 20;
+
+            let maxNodesInCol = 1;
+            layers.forEach(l => {
+                if (nodesByLayer[l].length > maxNodesInCol) maxNodesInCol = nodesByLayer[l].length;
+            });
+
+            const svgH = Math.max(140, maxNodesInCol * (stdH + rowGap) + padY * 2 + 16);
+
+            let currentX = padX;
+            const colXMap = {};
+            const colWidthMap = {};
+            layers.forEach(l => {
+                const w = (l === 0) ? curW : stdW;
+                colXMap[l] = currentX;
+                colWidthMap[l] = w;
+                currentX += w + colGap;
+            });
+            const svgW = Math.max(520, currentX - colGap + padX);
+
+            const nodeRects = {};
+            layers.forEach(l => {
+                const list = nodesByLayer[l];
+                const w = colWidthMap[l];
+                const h = (l === 0) ? curH : stdH;
+                const totalColH = list.length * h + (list.length - 1) * rowGap;
+                const startY = (svgH - totalColH) / 2;
+
+                list.forEach((id, idx) => {
+                    const nx = colXMap[l];
+                    const ny = startY + idx * (h + rowGap);
+                    nodeRects[id] = { x: nx, y: ny, w, h, layer: l };
+                });
+            });
+
+            let pathsHtml = '';
+            const drawnEdges = new Set();
+            allChainIds.forEach(fromId => {
+                const fromRect = nodeRects[fromId];
+                const children = succsMap[fromId] || new Set();
+                children.forEach(toId => {
+                    const toRect = nodeRects[toId];
+                    if (!fromRect || !toRect) return;
+                    const edgeKey = `${fromId}->${toId}`;
+                    if (drawnEdges.has(edgeKey)) return;
+                    drawnEdges.add(edgeKey);
+
+                    const isDirectToTarget = (fromId === currentTask.id || toId === currentTask.id);
+                    const strokeCol = isDirectToTarget ? '#ff00ea' : '#00f3ff';
+                    const strokeW = isDirectToTarget ? '2.2' : '1.3';
+                    const strokeOp = isDirectToTarget ? '0.95' : '0.45';
+                    const markerId = isDirectToTarget ? 'url(#chain-arrow-hot)' : 'url(#chain-arrow)';
+
+                    const x1 = fromRect.x + fromRect.w;
+                    const y1 = fromRect.y + fromRect.h / 2;
+                    const x2 = toRect.x;
+                    const y2 = toRect.y + toRect.h / 2;
+
+                    let d = '';
+                    if (x2 > x1) {
+                        const cx = (x1 + x2) / 2;
+                        d = `M ${x1} ${y1} C ${cx} ${y1}, ${cx} ${y2}, ${x2} ${y2}`;
+                    } else {
+                        const loopY = Math.min(y1, y2) - 24;
+                        d = `M ${x1} ${y1} C ${x1 + 25} ${loopY}, ${x2 - 25} ${loopY}, ${x2} ${y2}`;
+                    }
+
+                    pathsHtml += `<path d="${d}" fill="none" stroke="${strokeCol}" stroke-width="${strokeW}" opacity="${strokeOp}" marker-end="${markerId}" />`;
+                });
+            });
+
+            let nodesHtml = '';
+            allChainIds.forEach(id => {
+                const rect = nodeRects[id];
+                const t = taskMap[id] || { id, name: `(外部/不明 ID:${id})`, progress: 0, missing: true };
+                const pPct = (parseFloat(t.progress || 0) * 100).toFixed(0);
+                const isTarget = (id === currentTask.id);
+
+                if (isTarget) {
+                    const curName = t.name.length > 15 ? t.name.slice(0, 15) + '…' : t.name;
+                    nodesHtml += `
+                        <g>
+                            <rect class="current-node-pulse" x="${rect.x - 4}" y="${rect.y - 4}" width="${rect.w + 8}" height="${rect.h + 8}" rx="9"
+                                  fill="none" stroke="#ff00ea" stroke-width="2.5" />
+                            <rect x="${rect.x}" y="${rect.y}" width="${rect.w}" height="${rect.h}" rx="7"
+                                  fill="url(#targetNodeGrad)" stroke="#00f3ff" stroke-width="2.5"
+                                  style="filter: drop-shadow(0 0 10px rgba(0,243,255,0.65));" />
+                            <rect x="${rect.x + 8}" y="${rect.y - 8}" width="106" height="15" rx="3" fill="#ff00ea" />
+                            <text x="${rect.x + 61}" y="${rect.y + 3}" text-anchor="middle" fill="#ffffff" font-size="8.5" font-family="monospace" font-weight="bold">★ SELECTED TASK</text>
+                            <text x="${rect.x + 10}" y="${rect.y + 23}" fill="#00f3ff" font-size="10" font-family="monospace" font-weight="bold">ID #${escapeHtml(t.id)} (${pPct}%)</text>
+                            <text x="${rect.x + 10}" y="${rect.y + 42}" fill="#ffffff" font-size="11.5" font-weight="bold">${escapeHtml(curName)}</text>
+                        </g>
+                    `;
+                } else {
+                    const isUpstream = rect.layer < 0;
+                    const strokeCol = t.missing ? '#64748b' : (isUpstream ? (parseFloat(t.progress || 0) >= 0.999 ? '#00ff66' : '#00f3ff') : '#ffaa00');
+                    const tagPrefix = isUpstream ? `UP${rect.layer}` : `DN+${rect.layer}`;
+                    const labelName = t.name.length > 13 ? t.name.slice(0, 13) + '…' : t.name;
+                    const clickAttr = t.missing ? '' : `onclick="openTaskDetail('${t.id}')"`;
+
+                    nodesHtml += `
+                        <g class="dep-node-box" ${clickAttr}>
+                            <rect x="${rect.x}" y="${rect.y}" width="${rect.w}" height="${rect.h}" rx="6"
+                                  fill="rgba(10,20,45,0.95)" stroke="${strokeCol}" stroke-width="1.3" />
+                            <text x="${rect.x + 8}" y="${rect.y + 16}" fill="${strokeCol}" font-size="9.2" font-family="monospace" font-weight="bold">[${tagPrefix}] #${escapeHtml(t.id)} (${pPct}%)</text>
+                            <text x="${rect.x + 8}" y="${rect.y + 32}" fill="#e2e8f0" font-size="10.5">${escapeHtml(labelName)}</text>
+                        </g>
+                    `;
+                }
+            });
+
+            const targetRect = nodeRects[currentTask.id];
+            const targetCenterX = targetRect ? (targetRect.x + targetRect.w / 2) : null;
+
+            return {
+                upCount: upVisited.size - 1,
+                downCount: downVisited.size - 1,
+                targetCenterX,
+                svgHtml: `
+                    <svg width="${svgW}" height="${svgH}" viewBox="0 0 ${svgW} ${svgH}">
+                        <defs>
+                            <linearGradient id="targetNodeGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                                <stop offset="0%" stop-color="rgba(188, 19, 254, 0.45)" />
+                                <stop offset="100%" stop-color="rgba(0, 243, 255, 0.25)" />
+                            </linearGradient>
+                            <marker id="chain-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto">
+                                <path d="M 0 1 L 7 4 L 0 7 z" fill="#00f3ff" />
+                            </marker>
+                            <marker id="chain-arrow-hot" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+                                <path d="M 0 1 L 7 4 L 0 7 z" fill="#ff00ea" />
+                            </marker>
+                        </defs>
+                        ${pathsHtml}
+                        ${nodesHtml}
+                    </svg>
+                `
+            };
+        }
+
+        function closeTaskDetail() {
+            document.getElementById('drawerBackdrop').classList.remove('open');
+            document.getElementById('taskDrawer').classList.remove('open');
+        }
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeTaskDetail();
+        });
+
+        /* =========================================================
+           VIEW 2: GANTT CALENDAR RENDERER
+        ========================================================= */
+        function renderGantt() {
+            const labelsContainer = document.getElementById('gantt-labels');
+            const timelineContainer = document.getElementById('gantt-timeline');
+
+            const validTasks = tasks.filter(t => t.start && t.end);
+            if (validTasks.length === 0) {
+                labelsContainer.innerHTML = '<div style="padding:15px;">日付データがありません</div>';
+                return;
+            }
+
+            const allTimes = validTasks.flatMap(t => [parseLocalDate(t.start).getTime(), parseLocalDate(t.end).getTime()]);
+            allTimes.push(todayDate.getTime());
+
+            const dayMs = 24 * 60 * 60 * 1000;
+            const minDate = Math.min(...allTimes) - dayMs * 10;
+            const maxDate = Math.max(...allTimes) + dayMs * 18;
+
+            const totalDays = Math.ceil((maxDate - minDate) / dayMs);
+            const dayWidth = parseInt(document.getElementById('ganttZoom').value, 10) || 5;
+            const rowHeight = 34;
+
+            let headerHtml = `<div class="g-header" style="width:${totalDays * dayWidth}px; height: 35px;">`;
+            let currentMonth = '';
+            let monthDays = 0;
+
+            for (let i = 0; i < totalDays; i++) {
+                const d = new Date(minDate + i * dayMs);
+                const m = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+                if (m !== currentMonth) {
+                    if (currentMonth !== '') {
+                        headerHtml += `<div class="g-month" style="width:${monthDays * dayWidth}px">${currentMonth}</div>`;
+                    }
+                    currentMonth = m;
+                    monthDays = 1;
+                } else {
+                    monthDays++;
+                }
+            }
+            headerHtml += `<div class="g-month" style="width:${monthDays * dayWidth}px">${currentMonth}</div></div>`;
+
+            const visibleTasks = tasks.filter(t => !isTaskHiddenByCollapse(t));
+
+            let labelsHtml = `<div style="height:35px; border-bottom:1px solid rgba(0,243,255,0.25); background:rgba(10,18,38,0.98); display:flex; align-items:center; padding-left:12px; font-size:0.8rem; color:var(--neon-blue); letter-spacing:1px;">TASK HIERARCHY</div>`;
+            let barsHtml = headerHtml;
+
+            const todayX = ((todayDate.getTime() - minDate) / dayMs) * dayWidth;
+            barsHtml += `<div class="g-today-line" style="left:${todayX}px;"><span class="g-today-label">TODAY</span></div>`;
+
+            let yOffset = 35;
+            const barPosMap = {};
+
+            visibleTasks.forEach((t, rowIdx) => {
+                const pad = (t.level - 1) * 15;
+                const color = t.level === 1 ? 'var(--neon-blue)' : 'var(--text-main)';
+                const fontWeight = t.level === 1 ? 'bold' : 'normal';
+
+                let toggleIcon = '<span style="display:inline-block; width:20px; flex-shrink:0;"></span>';
+                if (t.has_children) {
+                    const icon = collapsedNodes.has(t.id) ? '+' : '-';
+                    toggleIcon = `<span class="toggle-btn" style="flex-shrink:0;" onclick="toggleCollapse('${t.id}', event)">[${icon}]</span>`;
+                }
+
+                labelsHtml += `
+                    <div class="g-row-label" onclick="openTaskDetail('${t.id}', false)" style="height:${rowHeight}px; padding-left:${pad + 8}px; color:${color}; font-weight:${fontWeight};" title="[${escapeHtml(t.id)}] ${escapeHtml(t.name)}">
+                        ${toggleIcon}
+                        <span style="overflow:hidden; text-overflow:ellipsis;">${escapeHtml(t.name)}</span>
+                    </div>`;
+
+                barsHtml += `<div class="g-row-bg" style="top:${yOffset}px; height:${rowHeight}px;"></div>`;
+
+                if (t.start && t.end) {
+                    const sTime = parseLocalDate(t.start).getTime();
+                    const eTime = parseLocalDate(t.end).getTime();
+                    const startX = ((sTime - minDate) / dayMs) * dayWidth;
+                    const w = Math.max(((eTime - sTime) / dayMs) * dayWidth, 8);
+                    const centerY = yOffset + rowHeight / 2;
+
+                    barPosMap[t.id] = { startX, endX: startX + w, centerY };
+
+                    const alertInfo = getAlertInfo(t);
+                    let barColor = t.level === 1 ? '#bc13fe' : '#00f3ff';
+                    let textColor = t.level === 1 ? '#ffffff' : '#030712';
+                    let glowColor = barColor;
+
+                    if (alertInfo) {
+                        if (alertInfo.type === 'overdue') {
+                            barColor = '#ff2a5f';
+                            textColor = '#ffffff';
+                            glowColor = '#ff2a5f';
+                        } else {
+                            barColor = '#ffaa00';
+                            textColor = '#030712';
+                            glowColor = '#ffaa00';
+                        }
+                    }
+
+                    const prog = (parseFloat(t.progress || 0) * 100).toFixed(0);
+                    const animDelay = Math.min(rowIdx * 16, 480);
+
+                    barsHtml += `
+                        <div class="g-bar"
+                             data-task-id="${t.id}"
+                             onclick="openTaskDetail('${t.id}', false)"
+                             onmouseenter="highlightDeps('${t.id}')"
+                             onmouseleave="clearDepHighlight()"
+                             style="top:${yOffset + 8}px; left:${startX}px; width:${w}px; background:${barColor}; color:${textColor}; box-shadow: 0 0 8px ${glowColor}; animation-delay:${animDelay}ms;"
+                             title="[ID:${escapeHtml(t.id)}] ${escapeHtml(t.name)} (${t.start} 〜 ${t.end} / 進捗:${prog}%)">
+                            ${w > 28 ? prog + '%' : ''}
+                        </div>`;
+                }
+                yOffset += rowHeight;
+            });
+
+            if (showDepLines) {
+                const edgeSet = new Set();
+                const edges = [];
+
+                visibleTasks.forEach(t => {
+                    (t.predecessors || []).forEach(predId => {
+                        const key = `${predId}->${t.id}`;
+                        if (!edgeSet.has(key)) {
+                            edgeSet.add(key);
+                            edges.push({ from: predId, to: t.id });
+                        }
+                    });
+                    (t.successors || []).forEach(succId => {
+                        const key = `${t.id}->${succId}`;
+                        if (!edgeSet.has(key)) {
+                            edgeSet.add(key);
+                            edges.push({ from: t.id, to: succId });
+                        }
+                    });
+                });
+
+                let pathsHtml = '';
+                edges.forEach(edge => {
+                    const fromPos = barPosMap[edge.from];
+                    const toPos = barPosMap[edge.to];
+                    if (!fromPos || !toPos) return;
+
+                    const x1 = fromPos.endX;
+                    const y1 = fromPos.centerY;
+                    const x2 = toPos.startX;
+                    const y2 = toPos.centerY;
+                    const gap = 10;
+
+                    let d = '';
+                    if (x2 >= x1 + gap) {
+                        const midX = x1 + gap;
+                        d = `M ${x1} ${y1} L ${midX} ${y1} L ${midX} ${y2} L ${x2} ${y2}`;
+                    } else {
+                        const outX = x1 + gap;
+                        const inX = Math.max(0, x2 - gap);
+                        const midY = y1 + (y2 > y1 ? rowHeight / 2 : -rowHeight / 2);
+                        d = `M ${x1} ${y1} L ${outX} ${y1} L ${outX} ${midY} L ${inX} ${midY} L ${inX} ${y2} L ${x2} ${y2}`;
+                    }
+
+                    pathsHtml += `<path class="dep-path" data-from="${edge.from}" data-to="${edge.to}" d="${d}" marker-end="url(#dep-arrow)" />`;
+                });
+
+                const totalWidth = totalDays * dayWidth;
+                barsHtml += `
+                    <svg class="dep-svg" width="${totalWidth}" height="${yOffset}">
+                        <defs>
+                            <marker id="dep-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+                                <path d="M 0 1 L 7 4 L 0 7 z" fill="#00f3ff" />
+                            </marker>
+                        </defs>
+                        ${pathsHtml}
+                    </svg>`;
+            }
+
+            labelsContainer.innerHTML = labelsHtml;
+            timelineContainer.innerHTML = barsHtml;
+            timelineContainer.style.width = (totalDays * dayWidth) + 'px';
+            timelineContainer.style.height = yOffset + 'px';
+        }
+
+        function highlightDeps(taskId) {
+            const paths = document.querySelectorAll('.dep-path');
+            if (!paths.length) return;
+            paths.forEach(p => {
+                if (p.dataset.from === taskId || p.dataset.to === taskId) {
+                    p.classList.add('highlighted');
+                    p.classList.remove('dimmed');
+                } else {
+                    p.classList.add('dimmed');
+                    p.classList.remove('highlighted');
+                }
+            });
+        }
+
+        function clearDepHighlight() {
+            document.querySelectorAll('.dep-path').forEach(p => {
+                p.classList.remove('highlighted', 'dimmed');
+            });
+        }
+
+        function syncScroll() {
+            const timeline = document.getElementById('gantt-scroll');
+            const labels = document.getElementById('gantt-labels');
+            labels.scrollTop = timeline.scrollTop;
+        }
+
+        /* =========================================================
+           VIEW 3: RESOURCE DAILY WORKLOAD ANALYTICS & GRAPHICAL BREAKDOWN
+        ========================================================= */
+        let currentWorkloadCache = null;
+
+        function getOverloadLimit() {
+            const el = document.getElementById('resOverloadLimit');
+            const val = parseFloat(el ? el.value : '8');
+            return (!isNaN(val) && val > 0) ? val : 8.0;
+        }
+
+        function onOverloadLimitChange() {
+            renderResourceView();
+            if (selectedHeatmapCell) {
+                showResourceDayDetail(selectedHeatmapCell.resName, selectedHeatmapCell.dateKey, false);
+            }
+        }
+
+        function computeResourceWorkload() {
+            const dayMode = document.getElementById('resDayMode').value;
+            const dayMs = 24 * 60 * 60 * 1000;
+
+            const leafTasks = tasks.filter(t => !t.has_children && t.work_hours_num > 0 && t.start && t.end);
+
+            if (leafTasks.length === 0) {
+                return null;
+            }
+
+            let minTime = Infinity;
+            let maxTime = -Infinity;
+            leafTasks.forEach(t => {
+                const s = parseLocalDate(t.start).getTime();
+                const e = parseLocalDate(t.end).getTime();
+                if (s < minTime) minTime = s;
+                if (e > maxTime) maxTime = e;
+            });
+
+            const allDates = [];
+            for (let tm = minTime; tm <= maxTime; tm += dayMs) {
+                const d = new Date(tm);
+                const dow = d.getDay();
+                allDates.push({
+                    key: formatDateKey(d),
+                    date: d,
+                    isWeekend: (dow === 0 || dow === 6),
+                    shortLabel: `${d.getMonth() + 1}/${d.getDate()}`
+                });
+            }
+
+            const resourceSet = new Set();
+            leafTasks.forEach(t => {
+                resourceSet.add(t.resource || '未割り当て');
+            });
+            const resourceList = [...resourceSet];
+
+            const matrix = {};
+            const resTotals = {};
+            resourceList.forEach(r => {
+                matrix[r] = {};
+                resTotals[r] = { totalHours: 0, taskCount: 0, peakHours: 0 };
+            });
+
+            leafTasks.forEach(t => {
+                const rName = t.resource || '未割り当て';
+                resTotals[rName].totalHours += t.work_hours_num;
+                resTotals[rName].taskCount += 1;
+
+                const sDate = parseLocalDate(t.start);
+                const eDate = parseLocalDate(t.end);
+                const spanDates = [];
+                for (let tm = sDate.getTime(); tm <= eDate.getTime(); tm += dayMs) {
+                    const d = new Date(tm);
+                    const dow = d.getDay();
+                    if (dayMode === 'all_days' || (dow !== 0 && dow !== 6)) {
+                        spanDates.push(formatDateKey(d));
+                    }
+                }
+                if (spanDates.length === 0) {
+                    for (let tm = sDate.getTime(); tm <= eDate.getTime(); tm += dayMs) {
+                        spanDates.push(formatDateKey(new Date(tm)));
+                    }
+                }
+
+                const perDay = t.work_hours_num / spanDates.length;
+                spanDates.forEach(dk => {
+                    if (!matrix[rName][dk]) matrix[rName][dk] = { hours: 0, entries: [] };
+                    matrix[rName][dk].hours += perDay;
+                    matrix[rName][dk].entries.push({ task: t, dailyHours: perDay });
+                });
+            });
+
+            resourceList.forEach(r => {
+                let peak = 0;
+                Object.values(matrix[r]).forEach(cell => {
+                    if (cell.hours > peak) peak = cell.hours;
+                });
+                resTotals[r].peakHours = peak;
+            });
+
+            return { allDates, resourceList, matrix, resTotals };
+        }
+
+        function renderResourceView() {
+            const cardsEl = document.getElementById('resSummaryCards');
+            const chartEl = document.getElementById('resDailyBarSvgContainer');
+            const hmEl = document.getElementById('resHeatmapContainer');
+
+            const data = computeResourceWorkload();
+            currentWorkloadCache = data;
+
+            if (!data) {
+                cardsEl.innerHTML = `<div style="color:var(--text-muted); font-size:0.85rem;">作業時間（時間）および開始日・終了日が設定された末端タスクがありません。</div>`;
+                chartEl.innerHTML = '';
+                hmEl.innerHTML = '';
+                return;
+            }
+
+            const { allDates, resourceList, matrix, resTotals } = data;
+            const selectedRes = document.getElementById('resChartSelect').value;
+            const overloadLimit = getOverloadLimit();
+
+            const maxTotalHours = Math.max(1, ...resourceList.map(r => resTotals[r].totalHours));
+
+            // 1. リソース別サマリーカード
+            let cardsHtml = `
+                <div class="res-card ${selectedRes === '__ALL__' ? 'active-res' : ''}" style="animation-delay:0ms;" onclick="selectWorkloadResource('__ALL__')">
+                    <div class="res-card-name">ALL RESOURCES (全体)</div>
+                    <div class="res-card-stats">
+                        <span>計 ${resourceList.length} 名/組</span>
+                        <span>${resourceList.reduce((s, r) => s + resTotals[r].totalHours, 0).toFixed(0)}h</span>
+                    </div>
+                    <div class="res-card-bar"><div class="res-card-fill" style="width:100%;"></div></div>
+                </div>
+            `;
+
+            resourceList.forEach((r, idx) => {
+                const st = resTotals[r];
+                const barW = (st.totalHours / maxTotalHours) * 100;
+                const peakColor = st.peakHours > overloadLimit ? 'var(--neon-red)' : 'var(--neon-green)';
+                const delay = Math.min((idx + 1) * 50, 400);
+                cardsHtml += `
+                    <div class="res-card ${selectedRes === r ? 'active-res' : ''}" style="animation-delay:${delay}ms;" onclick="selectWorkloadResource('${escapeHtml(r)}')">
+                        <div class="res-card-name" title="${escapeHtml(r)}">${escapeHtml(r)}</div>
+                        <div class="res-card-stats">
+                            <span>計 ${st.totalHours.toFixed(1)}h (${st.taskCount}件)</span>
+                            <span style="color:${peakColor};">最大 ${st.peakHours.toFixed(1)}h/日</span>
+                        </div>
+                        <div class="res-card-bar"><div class="res-card-fill" style="width:${barW}%;"></div></div>
+                    </div>
+                `;
+            });
+            cardsEl.innerHTML = cardsHtml;
+
+            // 2. 日別作業時間SVG棒グラフ
+            const colW = 24;
+            const chartH = 210;
+            const padL = 42;
+            const padB = 34;
+            const padT = 18;
+            const plotH = chartH - padT - padB;
+            const svgW = Math.max(640, padL + allDates.length * colW + 20);
+
+            const dailySeries = allDates.map(dObj => {
+                let hrs = 0;
+                if (selectedRes === '__ALL__') {
+                    resourceList.forEach(r => {
+                        hrs += (matrix[r][dObj.key]?.hours || 0);
+                    });
+                } else {
+                    hrs = matrix[selectedRes]?.[dObj.key]?.hours || 0;
+                }
+                return { ...dObj, hours: hrs };
+            });
+
+            const maxDaily = Math.max(overloadLimit * 1.25, ...dailySeries.map(d => d.hours), 1);
+            const limitY = padT + plotH - (overloadLimit / maxDaily) * plotH;
+
+            let barsSvg = '';
+            dailySeries.forEach((d, idx) => {
+                const x = padL + idx * colW + 3;
+                const bw = colW - 6;
+                const bh = (d.hours / maxDaily) * plotH;
+                const y = padT + plotH - bh;
+
+                const isOver = (selectedRes !== '__ALL__' && d.hours > overloadLimit) || (selectedRes === '__ALL__' && d.hours > overloadLimit * resourceList.length);
+                const fillCol = isOver ? '#ff2a5f' : (d.hours > overloadLimit * 0.75 ? '#ffaa00' : '#00f3ff');
+                const barDelay = Math.min(idx * 10, 450);
+
+                if (d.hours > 0) {
+                    barsSvg += `
+                        <rect class="res-bar-rect" x="${x}" y="${y}" width="${bw}" height="${bh}" rx="2" fill="${fillCol}" opacity="0.88" style="animation-delay:${barDelay}ms;">
+                            <title>${d.key}: ${d.hours.toFixed(2)} 時間</title>
+                        </rect>
+                    `;
+                    if (d.hours >= 1) {
+                        barsSvg += `<text x="${x + bw / 2}" y="${Math.max(11, y - 3)}" text-anchor="middle" fill="#cbd5e1" font-size="8" font-family="monospace">${d.hours.toFixed(0)}</text>`;
+                    }
+                }
+
+                if (idx % 3 === 0 || d.key === todayStr) {
+                    const lblCol = d.key === todayStr ? '#00ff66' : '#64748b';
+                    barsSvg += `<text x="${x + bw / 2}" y="${chartH - 12}" text-anchor="middle" fill="${lblCol}" font-size="8.5" font-family="monospace">${d.shortLabel}</text>`;
+                }
+                if (d.key === todayStr) {
+                    barsSvg += `<line x1="${x + bw / 2}" y1="${padT}" x2="${x + bw / 2}" y2="${padT + plotH}" stroke="#00ff66" stroke-width="1.5" stroke-dasharray="3,2" />`;
+                }
+            });
+
+            let limitLineSvg = '';
+            if (selectedRes !== '__ALL__') {
+                limitLineSvg = `
+                    <line x1="${padL}" y1="${limitY}" x2="${svgW - 10}" y2="${limitY}" stroke="#ff2a5f" stroke-width="1.4" stroke-dasharray="5,4" />
+                    <text x="${padL + 6}" y="${Math.max(12, limitY - 4)}" fill="#ff2a5f" font-size="9.5" font-family="monospace" font-weight="bold">OVERLOAD LIMIT: ${overloadLimit}h/日</text>
+                `;
+            }
+
+            chartEl.innerHTML = `
+                <svg width="${svgW}" height="${chartH}" viewBox="0 0 ${svgW} ${chartH}">
+                    <line x1="${padL}" y1="${padT}" x2="${padL}" y2="${padT + plotH}" stroke="rgba(255,255,255,0.2)" />
+                    <line x1="${padL}" y1="${padT + plotH}" x2="${svgW - 10}" y2="${padT + plotH}" stroke="rgba(255,255,255,0.2)" />
+                    <text x="${padL - 6}" y="${padT + 6}" text-anchor="end" fill="#64748b" font-size="9" font-family="monospace">${maxDaily.toFixed(0)}h</text>
+                    <text x="${padL - 6}" y="${padT + plotH / 2}" text-anchor="end" fill="#64748b" font-size="9" font-family="monospace">${(maxDaily / 2).toFixed(0)}h</text>
+                    <text x="${padL - 6}" y="${padT + plotH}" text-anchor="end" fill="#64748b" font-size="9" font-family="monospace">0h</text>
+                    ${barsSvg}
+                    ${limitLineSvg}
+                </svg>
+            `;
+
+            // 3. リソース × 日付 ヒートマップマトリクス
+            const targetResources = selectedRes === '__ALL__' ? resourceList : [selectedRes];
+            let thHtml = `<tr><th class="sticky-res">リソース / 日付</th>`;
+            allDates.forEach(d => {
+                const isToday = d.key === todayStr;
+                const style = isToday ? 'background:rgba(0,255,102,0.2); color:#00ff66;' : (d.isWeekend ? 'color:#64748b;' : '');
+                thHtml += `<th style="${style}" title="${d.key}">${d.shortLabel}</th>`;
+            });
+            thHtml += `</tr>`;
+
+            let tbHtml = '';
+            targetResources.forEach(r => {
+                tbHtml += `<tr><td class="sticky-res" title="${escapeHtml(r)}">${escapeHtml(r)}</td>`;
+                allDates.forEach(d => {
+                    const cell = matrix[r][d.key];
+                    const hrs = cell ? cell.hours : 0;
+                    let cls = 'hm-cell ';
+                    if (hrs <= 0) cls += 'hm-0';
+                    else if (hrs > overloadLimit) cls += 'hm-over';
+                    else if (hrs > overloadLimit * 0.75) cls += 'hm-high';
+                    else if (hrs > overloadLimit * 0.35) cls += 'hm-mid';
+                    else cls += 'hm-low';
+
+                    if (d.isWeekend) cls += ' hm-weekend';
+                    if (selectedHeatmapCell && selectedHeatmapCell.resName === r && selectedHeatmapCell.dateKey === d.key) {
+                        cls += ' hm-selected';
+                    }
+
+                    const disp = hrs > 0 ? hrs.toFixed(1) : '-';
+                    const clickAttr = hrs > 0 ? `onclick="showResourceDayDetail('${escapeHtml(r)}', '${d.key}')"` : '';
+                    tbHtml += `<td class="${cls}" ${clickAttr} title="${r} | ${d.key}: ${hrs.toFixed(2)}時間 (クリックで円グラフ詳細)">${disp}</td>`;
+                });
+                tbHtml += `</tr>`;
+            });
+
+            hmEl.innerHTML = `<table class="heatmap-table"><thead>${thHtml}</thead><tbody>${tbHtml}</tbody></table>`;
+        }
+
+        function selectWorkloadResource(resName) {
+            document.getElementById('resChartSelect').value = resName;
+            renderResourceView();
+        }
+
+        function showResourceDayDetail(resName, dateKey, reRenderMatrix = true) {
+            const panel = document.getElementById('resCellDetailPanel');
+            if (!currentWorkloadCache) return;
+            const cell = currentWorkloadCache.matrix[resName]?.[dateKey];
+            if (!cell || cell.hours <= 0) return;
+
+            selectedHeatmapCell = { resName, dateKey };
+            if (reRenderMatrix) {
+                renderResourceView();
+            }
+
+            const overloadLimit = getOverloadLimit();
+            const totalHrs = cell.hours;
+            const loadPct = (totalHrs / overloadLimit) * 100;
+            const isOver = totalHrs > overloadLimit;
+            const statusCol = isOver ? 'var(--neon-red)' : (loadPct > 75 ? 'var(--neon-amber)' : 'var(--neon-green)');
+            const statusLabel = isOver ? `OVERLOAD (+${(totalHrs - overloadLimit).toFixed(1)}h超過)` : `NORMAL (${loadPct.toFixed(0)}%)`;
+
+            // 時間が多い順にソート
+            const sortedEntries = [...cell.entries].sort((a, b) => b.dailyHours - a.dailyHours);
+
+            // SVGドーナツ円グラフ生成
+            const radius = 52;
+            const circumference = 2 * Math.PI * radius;
+            let cumulativeRatio = 0;
+            let pieSegmentsSvg = '';
+
+            sortedEntries.forEach((entry, idx) => {
+                const color = PIE_PALETTE[idx % PIE_PALETTE.length];
+                const ratio = entry.dailyHours / totalHrs;
+                const segLen = ratio * circumference;
+                const offset = -cumulativeRatio * circumference;
+                cumulativeRatio += ratio;
+
+                pieSegmentsSvg += `
+                    <circle cx="70" cy="70" r="${radius}" fill="none" stroke="${color}" stroke-width="16"
+                            stroke-dasharray="${segLen} ${circumference}"
+                            stroke-dashoffset="${offset}"
+                            transform="rotate(-90 70 70)"
+                            style="filter: drop-shadow(0 0 4px ${color}); transition: stroke-dasharray 0.6s ease;">
+                        <title>#${escapeHtml(entry.task.id)} ${escapeHtml(entry.task.name)}: ${entry.dailyHours.toFixed(2)}h (${(ratio * 100).toFixed(1)}%)</title>
+                    </circle>
+                `;
+            });
+
+            // タスク内訳一覧HTML
+            const listHtml = sortedEntries.map((entry, idx) => {
+                const color = PIE_PALETTE[idx % PIE_PALETTE.length];
+                const sharePct = ((entry.dailyHours / totalHrs) * 100).toFixed(1);
+                const taskProg = (parseFloat(entry.task.progress || 0) * 100).toFixed(0);
+                return `
+                    <div class="day-task-row" onclick="openTaskDetail('${entry.task.id}', false)" title="クリックでタスク詳細HUDを開く">
+                        <div style="display:flex; align-items:center; gap:10px; min-width:0; flex:1;">
+                            <span class="day-color-dot" style="background:${color}; box-shadow:0 0 6px ${color};"></span>
+                            <div style="min-width:0; flex:1;">
+                                <div style="font-size:0.84rem; font-weight:bold; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+                                    <span style="color:var(--text-muted); font-family:monospace; margin-right:6px;">#${escapeHtml(entry.task.id)}</span>
+                                    <span>${escapeHtml(entry.task.name)}</span>
+                                </div>
+                                <div style="font-size:0.72rem; color:var(--text-muted); margin-top:2px;">
+                                    期間: ${entry.task.start} 〜 ${entry.task.end} ｜ 総工数: ${escapeHtml(entry.task.work_hours) || '-'} ｜ タスク進捗: <span style="color:var(--neon-green);">${taskProg}%</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div style="text-align:right; flex-shrink:0; font-family:monospace;">
+                            <div style="font-size:0.9rem; font-weight:bold; color:${color};">${entry.dailyHours.toFixed(2)} h/日</div>
+                            <div style="font-size:0.72rem; color:var(--text-muted);">シェア ${sharePct}%</div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+
+            const dow = getDayOfWeekJa(dateKey);
+            const meterWidth = Math.min(100, loadPct);
+
+            panel.style.display = 'block';
+            panel.innerHTML = `
+                <div class="day-breakdown-header">
+                    <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+                        <span style="font-family:monospace; font-size:0.76rem; padding:2px 8px; border-radius:4px; background:rgba(0,243,255,0.15); border:1px solid var(--neon-blue); color:var(--neon-blue);">DAILY WORKLOAD BREAKDOWN</span>
+                        <strong style="font-size:0.98rem; color:#fff;">${escapeHtml(resName)}</strong>
+                        <span style="font-family:monospace; color:var(--neon-purple); font-weight:bold;">${dateKey} (${dow})</span>
+                        <span style="font-family:monospace; font-size:0.78rem; padding:2px 8px; border-radius:12px; border:1px solid ${statusCol}; color:${statusCol}; font-weight:bold;">${statusLabel}</span>
+                    </div>
+                    <button class="mini-btn" onclick="closeResourceDayDetail()">✕ 閉じる</button>
+                </div>
+
+                <div class="day-breakdown-grid">
+                    <div class="day-pie-box">
+                        <svg width="140" height="140" viewBox="0 0 140 140">
+                            <circle cx="70" cy="70" r="${radius}" fill="none" stroke="rgba(255,255,255,0.06)" stroke-width="16" />
+                            ${pieSegmentsSvg}
+                            <text x="70" y="68" text-anchor="middle" fill="#ffffff" font-size="18" font-family="monospace" font-weight="bold">${totalHrs.toFixed(1)}h</text>
+                            <text x="70" y="84" text-anchor="middle" fill="#94a3b8" font-size="9.5" font-family="monospace">${sortedEntries.length} TASKS</text>
+                        </svg>
+                        <div style="font-size:0.72rem; color:var(--text-muted); margin-top:4px; font-family:monospace;">基準上限: ${overloadLimit.toFixed(1)}h/日</div>
+                    </div>
+
+                    <div style="display:flex; flex-direction:column; gap:10px; min-width:0;">
+                        <div>
+                            <div style="display:flex; justify-content:space-between; font-size:0.76rem; margin-bottom:4px; font-family:monospace;">
+                                <span style="color:var(--text-muted);">日次稼働キャパシティ (${totalHrs.toFixed(2)}h / 基準 ${overloadLimit.toFixed(1)}h)</span>
+                                <span style="color:${statusCol}; font-weight:bold;">${loadPct.toFixed(0)}%</span>
+                            </div>
+                            <div style="height:7px; background:rgba(255,255,255,0.08); border-radius:4px; overflow:hidden;">
+                                <div style="height:100%; width:${meterWidth}%; background:${statusCol}; box-shadow:0 0 8px ${statusCol}; transition:width 0.5s ease;"></div>
+                            </div>
+                        </div>
+                        <div class="day-task-list">
+                            ${listHtml}
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function closeResourceDayDetail() {
+            selectedHeatmapCell = null;
+            document.getElementById('resCellDetailPanel').style.display = 'none';
+            renderResourceView();
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            initData();
+            renderAlerts();
+            renderDashboard();
+            renderTable();
+        });
+    </script>
+</body>
+</html>"""
+
+        html_content = html_template.replace('__WBS_JSON_DATA__', json_data)
+
+        output_dir = os.path.dirname(os.path.abspath(file_path))
+        output_file = os.path.join(output_dir, 'wbs_dashboard.html')
+
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+
+        print(f"✅ 作成完了: {output_file}")
+        try:
+            messagebox.showinfo("完了", f"ダッシュボードの作成が完了しました。\n\n保存先:\n{output_file}")
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f"❌ エラーが発生しました: {e}")
+        try:
+            messagebox.showerror("エラー", f"処理中にエラーが発生しました:\n{e}")
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
