@@ -1,0 +1,1200 @@
+import pandas as pd
+import json
+import os
+import re
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+
+def clean_val(val):
+    if pd.isna(val):
+        return ""
+    val_str = str(val).replace('?', '').strip()
+    if val_str.lower() == "nan":
+        return ""
+    return val_str
+
+
+def clean_id(val):
+    """Excel数値読み込み時の '.0' 付与を除去してID文字列を正規化"""
+    s = clean_val(val)
+    if not s:
+        return ""
+    return re.sub(r'\.0$', '', s)
+
+
+def parse_id_list(val):
+    """カンマ区切りなどの先行・後続タスクIDを配列化"""
+    s = clean_val(val)
+    if not s or s == "N/A":
+        return []
+    parts = re.split(r'[,、\s]+', s)
+    result = []
+    for p in parts:
+        cleaned = re.sub(r'\.0$', '', p.strip())
+        if cleaned:
+            result.append(cleaned)
+    return result
+
+
+def get_col_val(row, col_names, df_columns):
+    for name in col_names:
+        if name in df_columns:
+            return clean_val(row[name])
+    return ""
+
+
+def format_date_iso(date_str):
+    """「YYYY年MM月DD日 8:00」や「26/01/15 (木)」を「YYYY-MM-DD」に正規化"""
+    if not date_str or str(date_str) == "N/A":
+        return ""
+    s = str(date_str).strip()
+
+    # 4桁年 (例: 2025年10月15日 8:00, 2025/10/15, 2025-10-15)
+    m4 = re.search(r'(\d{4})[年/\-](\d{1,2})[月/\-](\d{1,2})', s)
+    if m4:
+        return f"{int(m4.group(1)):04d}-{int(m4.group(2)):02d}-{int(m4.group(3)):02d}"
+
+    # 2桁年 (例: 26/01/15 (木))
+    m2 = re.search(r'(?<!\d)(\d{2})[年/\-](\d{1,2})[月/\-](\d{1,2})', s)
+    if m2:
+        year = 2000 + int(m2.group(1))
+        return f"{year:04d}-{int(m2.group(2)):02d}-{int(m2.group(3)):02d}"
+
+    return ""
+
+
+def main():
+    root = tk.Tk()
+    root.withdraw()
+    file_path = filedialog.askopenfilename(
+        title="WBSのExcelまたはCSVファイルを選択してください",
+        filetypes=[("Excel files", "*.xlsx *.xls"), ("CSV files", "*.csv")]
+    )
+
+    if not file_path:
+        print("キャンセルされました。")
+        return
+
+    try:
+        if file_path.endswith('.csv'):
+            try:
+                df = pd.read_csv(file_path, encoding='utf-8-sig')
+            except Exception:
+                df = pd.read_csv(file_path, encoding='cp932')
+        else:
+            df = pd.read_excel(file_path)
+
+        tasks = []
+        last_at_level = {}
+        top_level_id = None
+
+        for _, row in df.iterrows():
+            raw_prog = get_col_val(row, ["達成率", "進捗率"], df.columns)
+            try:
+                progress = float(raw_prog)
+            except Exception:
+                progress = 0.0
+
+            lvl_str = clean_id(get_col_val(row, ["アウトライン_レベル", "アウトライン"], df.columns))
+            try:
+                lvl = int(lvl_str)
+            except Exception:
+                lvl = 1
+
+            task_id = clean_id(get_col_val(row, ["ID", "ＩＤ"], df.columns))
+            if not task_id:
+                continue
+
+            # 親子関係の特定
+            parent_id = None
+            if lvl == 1:
+                top_level_id = task_id
+            elif lvl > 1:
+                parent_id = last_at_level.get(lvl - 1)
+
+            last_at_level[lvl] = task_id
+
+            task = {
+                'id': task_id,
+                'level': lvl,
+                'parent_id': parent_id,
+                'top_parent_id': top_level_id if lvl > 1 else task_id,
+                'name': get_col_val(row, ["タスク名"], df.columns),
+                'work_hours': get_col_val(row, ["作業時間"], df.columns),
+                'duration': get_col_val(row, ["期間"], df.columns),
+                'start': format_date_iso(get_col_val(row, ["開始日"], df.columns)),
+                'end': format_date_iso(get_col_val(row, ["終了日"], df.columns)),
+                'deadline': format_date_iso(get_col_val(row, ["期限"], df.columns)),
+                'resource': get_col_val(row, ["リソース名", "リソース"], df.columns),
+                'stakeholder': get_col_val(row, ["関係者"], df.columns),
+                'predecessors': parse_id_list(get_col_val(row, ["先行タスク"], df.columns)),
+                'successors': parse_id_list(get_col_val(row, ["後続タスク"], df.columns)),
+                'progress': progress,
+                'has_children': False
+            }
+            tasks.append(task)
+
+        # 子タスクを持つ親タスクのフラグ設定
+        parent_ids = {t['parent_id'] for t in tasks if t['parent_id']}
+        for t in tasks:
+            if t['id'] in parent_ids:
+                t['has_children'] = True
+
+        json_data = json.dumps(tasks, ensure_ascii=False)
+
+        html_content = rf"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CYBER-WBS DASHBOARD</title>
+    <style>
+        :root {{
+            --bg-color: #030712;
+            --panel-bg: rgba(13, 22, 46, 0.72);
+            --neon-blue: #00f3ff;
+            --neon-purple: #bc13fe;
+            --neon-green: #00ff66;
+            --neon-amber: #ffaa00;
+            --neon-red: #ff2a5f;
+            --text-main: #e2e8f0;
+            --text-muted: #64748b;
+            --border-glow: rgba(0, 243, 255, 0.22);
+        }}
+        * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', system-ui, sans-serif; }}
+        body {{
+            background: radial-gradient(circle at top, #0a1128 0%, var(--bg-color) 100%);
+            color: var(--text-main);
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }}
+
+        /* Header */
+        .header {{
+            padding: 12px 28px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border-glow);
+            background: rgba(3, 7, 18, 0.88);
+            backdrop-filter: blur(10px);
+            z-index: 100;
+        }}
+        .header-left {{ display: flex; align-items: center; gap: 20px; }}
+        .header h1 {{ font-size: 1.4rem; letter-spacing: 3px; color: var(--neon-blue); text-shadow: 0 0 10px var(--neon-blue); }}
+        .today-badge {{
+            font-family: monospace;
+            font-size: 0.85rem;
+            padding: 4px 10px;
+            border: 1px solid rgba(0, 243, 255, 0.4);
+            border-radius: 4px;
+            color: var(--neon-blue);
+            background: rgba(0, 243, 255, 0.08);
+        }}
+
+        .tabs {{ display: flex; gap: 12px; }}
+        .tab-btn {{
+            background: transparent;
+            border: 1px solid var(--text-muted);
+            color: var(--text-muted);
+            padding: 7px 18px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            letter-spacing: 1px;
+            transition: 0.25s;
+        }}
+        .tab-btn:hover {{ border-color: var(--neon-blue); color: var(--neon-blue); box-shadow: 0 0 8px rgba(0,243,255,0.3) inset; }}
+        .tab-btn.active {{ border-color: var(--neon-blue); color: var(--bg-color); background: var(--neon-blue); box-shadow: 0 0 12px var(--neon-blue); }}
+
+        .view-container {{ flex: 1; overflow-y: auto; padding: 18px 24px; position: relative; }}
+        .view {{ display: none; height: 100%; }}
+        .view.active {{ display: flex; flex-direction: column; }}
+
+        /* Panels */
+        .panel {{
+            background: var(--panel-bg);
+            backdrop-filter: blur(8px);
+            border: 1px solid var(--border-glow);
+            border-radius: 8px;
+            padding: 15px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+            display: flex;
+            flex-direction: column;
+        }}
+        .panel-header {{
+            font-size: 0.95rem;
+            color: var(--neon-purple);
+            border-bottom: 1px solid rgba(188, 19, 254, 0.3);
+            padding-bottom: 8px;
+            margin-bottom: 12px;
+            letter-spacing: 1px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+        }}
+
+        /* Alert Panel */
+        .alert-panel {{
+            border-color: rgba(255, 42, 95, 0.45);
+            margin-bottom: 16px;
+            background: linear-gradient(90deg, rgba(255, 42, 95, 0.08) 0%, rgba(13, 22, 46, 0.78) 100%);
+        }}
+        .alert-title-group {{ display: flex; align-items: center; gap: 12px; }}
+        .alert-title {{ color: var(--neon-red); text-shadow: 0 0 8px rgba(255, 42, 95, 0.6); font-weight: bold; }}
+        .alert-count-badge {{
+            font-size: 0.75rem;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-family: monospace;
+            font-weight: bold;
+        }}
+        .badge-overdue {{ background: rgba(255, 42, 95, 0.25); border: 1px solid var(--neon-red); color: #ff80a0; }}
+        .badge-soon {{ background: rgba(255, 170, 0, 0.2); border: 1px solid var(--neon-amber); color: #ffd066; }}
+        .badge-ok {{ background: rgba(0, 255, 102, 0.15); border: 1px solid var(--neon-green); color: var(--neon-green); }}
+
+        .alert-list {{
+            display: flex;
+            gap: 10px;
+            overflow-x: auto;
+            padding-bottom: 4px;
+        }}
+        .alert-card {{
+            min-width: 240px;
+            max-width: 280px;
+            padding: 10px 12px;
+            border-radius: 6px;
+            background: rgba(0, 0, 0, 0.45);
+            border-left: 3px solid var(--neon-amber);
+            cursor: pointer;
+            transition: 0.2s;
+            flex-shrink: 0;
+        }}
+        .alert-card:hover {{ transform: translateY(-2px); background: rgba(255, 255, 255, 0.07); }}
+        .alert-card.overdue {{ border-left-color: var(--neon-red); box-shadow: 0 0 10px rgba(255, 42, 95, 0.15) inset; }}
+        .alert-card-top {{ display: flex; justify-content: space-between; font-size: 0.75rem; font-family: monospace; margin-bottom: 4px; }}
+        .alert-card-name {{ font-size: 0.85rem; font-weight: bold; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 4px; }}
+        .alert-card-meta {{ font-size: 0.75rem; color: var(--text-muted); display: flex; justify-content: space-between; }}
+
+        /* Dashboard Grid */
+        .dashboard-grid {{ display: grid; grid-template-columns: 240px 1fr; gap: 16px; margin-bottom: 16px; }}
+        @media (max-width: 900px) {{ .dashboard-grid {{ grid-template-columns: 1fr; }} }}
+
+        /* Charts */
+        .pie-container {{ display: flex; flex-direction: column; align-items: center; justify-content: center; flex: 1; }}
+        .bar-chart {{ display: flex; flex-direction: column; gap: 10px; overflow-y: auto; max-height: 180px; padding-right: 6px; }}
+        .bar-item {{ display: flex; align-items: center; gap: 10px; font-size: 0.85rem; }}
+        .bar-label {{ width: 160px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+        .bar-track {{ flex: 1; background: rgba(255, 255, 255, 0.06); height: 7px; border-radius: 4px; position: relative; }}
+        .bar-fill {{ height: 100%; background: linear-gradient(90deg, var(--neon-purple), var(--neon-blue)); box-shadow: 0 0 8px var(--neon-blue); border-radius: 4px; transition: 0.8s; }}
+        .bar-percent {{ width: 42px; text-align: right; color: var(--neon-blue); font-family: monospace; }}
+
+        /* Controls & Filters */
+        .filter-bar {{ display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }}
+        .input-glow {{
+            background: rgba(0, 0, 0, 0.55);
+            border: 1px solid var(--text-muted);
+            color: var(--text-main);
+            padding: 6px 10px;
+            border-radius: 4px;
+            outline: none;
+            font-size: 0.82rem;
+            transition: 0.25s;
+        }}
+        .input-glow:focus {{ border-color: var(--neon-blue); box-shadow: 0 0 8px rgba(0,243,255,0.25); }}
+        .mini-btn {{
+            background: rgba(0, 243, 255, 0.08);
+            border: 1px solid rgba(0, 243, 255, 0.35);
+            color: var(--neon-blue);
+            padding: 5px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.78rem;
+            transition: 0.2s;
+        }}
+        .mini-btn:hover {{ background: rgba(0, 243, 255, 0.2); }}
+        .mini-btn.active {{ background: var(--neon-blue); color: #000; font-weight: bold; }}
+
+        /* Table */
+        .table-container {{ overflow: auto; flex: 1; }}
+        table {{ width: 100%; border-collapse: collapse; }}
+        th, td {{ padding: 9px 10px; text-align: left; border-bottom: 1px solid rgba(255, 255, 255, 0.05); font-size: 0.84rem; }}
+        th {{ color: var(--neon-blue); position: sticky; top: 0; background: rgba(10, 18, 38, 0.98); z-index: 10; font-weight: 500; white-space: nowrap; }}
+        tr:hover {{ background: rgba(0, 243, 255, 0.06); }}
+        .lvl-1 {{ font-weight: bold; background: rgba(0, 243, 255, 0.03); border-left: 2px solid var(--neon-blue); }}
+        tr.row-overdue {{ background: rgba(255, 42, 95, 0.08); }}
+        tr.row-soon {{ background: rgba(255, 170, 0, 0.06); }}
+        @keyframes flashRow {{
+            0% {{ background: rgba(0, 243, 255, 0.45); }}
+            100% {{ background: transparent; }}
+        }}
+        tr.flash {{ animation: flashRow 1.5s ease-out; }}
+
+        .status-pill {{
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 0.72rem;
+            font-family: monospace;
+            font-weight: bold;
+            margin-left: 6px;
+        }}
+        .pill-overdue {{ background: rgba(255, 42, 95, 0.25); color: #ff6b93; border: 1px solid var(--neon-red); }}
+        .pill-soon {{ background: rgba(255, 170, 0, 0.2); color: #ffc857; border: 1px solid var(--neon-amber); }}
+
+        .toggle-btn {{
+            cursor: pointer;
+            color: var(--neon-purple);
+            font-family: monospace;
+            font-size: 0.95rem;
+            font-weight: bold;
+            margin-right: 6px;
+            user-select: none;
+            display: inline-block;
+            width: 22px;
+            text-align: center;
+        }}
+        .toggle-btn:hover {{ color: var(--neon-blue); text-shadow: 0 0 6px var(--neon-blue); }}
+
+        /* Gantt Chart */
+        .gantt-toolbar {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+            padding: 8px 14px;
+            background: var(--panel-bg);
+            border: 1px solid var(--border-glow);
+            border-radius: 6px;
+            flex-wrap: wrap;
+            gap: 10px;
+        }}
+        .gantt-legend {{ display: flex; gap: 14px; font-size: 0.78rem; color: var(--text-muted); align-items: center; }}
+        .legend-dot {{ width: 10px; height: 10px; border-radius: 2px; display: inline-block; margin-right: 4px; }}
+
+        .gantt-wrapper {{
+            display: flex;
+            flex: 1;
+            min-height: 0;
+            background: var(--panel-bg);
+            border: 1px solid var(--border-glow);
+            border-radius: 8px;
+            overflow: hidden;
+        }}
+        .gantt-labels {{
+            width: 320px;
+            flex-shrink: 0;
+            border-right: 1px solid rgba(0,243,255,0.25);
+            overflow-y: hidden;
+            background: rgba(3, 7, 18, 0.55);
+        }}
+        .gantt-timeline-container {{ flex: 1; overflow: auto; position: relative; }}
+        .gantt-timeline {{ position: relative; min-height: 100%; }}
+
+        .g-header {{
+            display: flex;
+            background: rgba(10, 18, 38, 0.98);
+            position: sticky;
+            top: 0;
+            z-index: 25;
+            border-bottom: 1px solid rgba(0,243,255,0.25);
+        }}
+        .g-month {{
+            color: var(--neon-blue);
+            font-size: 0.76rem;
+            font-family: monospace;
+            text-align: center;
+            border-right: 1px solid rgba(255,255,255,0.08);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }}
+
+        .g-row-label {{
+            padding: 0 10px;
+            font-size: 0.82rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            display: flex;
+            align-items: center;
+            border-bottom: 1px solid rgba(255,255,255,0.04);
+        }}
+        .g-row-label:hover {{ background: rgba(0, 243, 255, 0.06); }}
+        .g-row-bg {{ border-bottom: 1px solid rgba(255,255,255,0.03); position: absolute; width: 100%; left: 0; }}
+
+        .g-bar {{
+            position: absolute;
+            height: 18px;
+            border-radius: 3px;
+            font-size: 0.7rem;
+            font-weight: bold;
+            display: flex;
+            align-items: center;
+            padding: 0 5px;
+            overflow: hidden;
+            white-space: nowrap;
+            cursor: pointer;
+            transition: filter 0.2s, transform 0.15s;
+            z-index: 10;
+        }}
+        .g-bar:hover {{ filter: brightness(1.25); transform: scaleY(1.12); z-index: 20; }}
+
+        .g-today-line {{
+            position: absolute;
+            top: 35px;
+            bottom: 0;
+            width: 2px;
+            background: var(--neon-green);
+            box-shadow: 0 0 8px var(--neon-green);
+            z-index: 15;
+            pointer-events: none;
+        }}
+        .g-today-label {{
+            position: sticky;
+            top: 36px;
+            background: var(--neon-green);
+            color: #000;
+            font-size: 0.65rem;
+            font-weight: bold;
+            padding: 1px 4px;
+            border-radius: 2px;
+            transform: translateX(-50%);
+            display: inline-block;
+        }}
+
+        /* Dependency SVG Layer */
+        .dep-svg {{
+            position: absolute;
+            top: 0;
+            left: 0;
+            pointer-events: none;
+            z-index: 6;
+        }}
+        .dep-path {{
+            fill: none;
+            stroke: rgba(0, 243, 255, 0.38);
+            stroke-width: 1.4;
+            transition: stroke 0.2s, stroke-width 0.2s, opacity 0.2s;
+        }}
+        .dep-path.dimmed {{ opacity: 0.12; }}
+        .dep-path.highlighted {{
+            stroke: #ff00ea;
+            stroke-width: 2.5;
+            opacity: 1;
+            filter: drop-shadow(0 0 4px #ff00ea);
+        }}
+
+        /* Scrollbar */
+        ::-webkit-scrollbar {{ width: 8px; height: 8px; }}
+        ::-webkit-scrollbar-track {{ background: rgba(0,0,0,0.25); }}
+        ::-webkit-scrollbar-thumb {{ background: rgba(0,243,255,0.3); border-radius: 4px; }}
+        ::-webkit-scrollbar-thumb:hover {{ background: var(--neon-blue); }}
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <div class="header-left">
+            <h1>SYS-WBS DASHBOARD</h1>
+            <span class="today-badge" id="todayDisplay">TODAY: ----/--/--</span>
+        </div>
+        <div class="tabs">
+            <button class="tab-btn active" onclick="switchTab('dashboard', this)">DETAILS &amp; CHARTS</button>
+            <button class="tab-btn" onclick="switchTab('calendar', this)">GANTT CALENDAR</button>
+        </div>
+    </div>
+
+    <!-- DASHBOARD VIEW -->
+    <div id="view-dashboard" class="view-container view active">
+        <!-- DEADLINE ALERT PANEL -->
+        <div class="panel alert-panel">
+            <div class="panel-header" style="border-bottom-color: rgba(255, 42, 95, 0.3); margin-bottom: 10px;">
+                <div class="alert-title-group">
+                    <span class="alert-title">DEADLINE ALERTS</span>
+                    <span id="alertSummaryBadges"></span>
+                </div>
+                <div class="filter-bar">
+                    <select id="alertThreshold" class="input-glow" onchange="refreshAlertsAndTable()">
+                        <option value="7">7日以内を警告</option>
+                        <option value="14" selected>14日以内を警告</option>
+                        <option value="30">30日以内を警告</option>
+                        <option value="60">60日以内を警告</option>
+                    </select>
+                    <select id="alertDateBasis" class="input-glow" onchange="refreshAlertsAndTable()">
+                        <option value="deadline_or_end" selected>基準: 期限優先 (N/Aは終了日)</option>
+                        <option value="deadline_only">基準: 「期限」列のみ</option>
+                    </select>
+                </div>
+            </div>
+            <div class="alert-list" id="alertListContainer"></div>
+        </div>
+
+        <div class="dashboard-grid">
+            <div class="panel">
+                <div class="panel-header">TOTAL PROGRESS</div>
+                <div class="pie-container" id="pie-chart-container"></div>
+            </div>
+            <div class="panel">
+                <div class="panel-header">PHASE PROGRESS (Level 1 Auto-Calculated)</div>
+                <div class="bar-chart" id="bar-chart-container"></div>
+            </div>
+        </div>
+
+        <div class="panel" style="flex:1; min-height: 280px;">
+            <div class="panel-header">
+                <span>TASK DETAILS</span>
+                <div class="filter-bar">
+                    <button class="mini-btn" onclick="expandAll()">すべて展開</button>
+                    <button class="mini-btn" onclick="collapseAll()">すべて折りたたむ</button>
+                    <label style="font-size:0.8rem; color:var(--text-main); display:flex; align-items:center; gap:5px; cursor:pointer;">
+                        <input type="checkbox" id="alertOnlyCheck" onchange="applyFilter()"> アラート対象のみ
+                    </label>
+                    <input type="text" id="searchInput" class="input-glow" placeholder="タスク名 / ID 検索..." onkeyup="applyFilter()">
+                    <select id="resourceFilter" class="input-glow" onchange="applyFilter()">
+                        <option value="">すべてのリソース</option>
+                    </select>
+                </div>
+            </div>
+            <div class="table-container">
+                <table id="wbs-table">
+                    <thead>
+                        <tr>
+                            <th style="width: 65px;">ID</th>
+                            <th>タスク名</th>
+                            <th style="width: 140px;">達成率</th>
+                            <th style="width: 120px;">期間 / 工数</th>
+                            <th style="width: 105px;">開始日</th>
+                            <th style="width: 105px;">終了日</th>
+                            <th style="width: 105px;">期限</th>
+                            <th style="width: 130px;">リソース</th>
+                            <th style="width: 110px;">先行 / 後続</th>
+                        </tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- CALENDAR (GANTT) VIEW -->
+    <div id="view-calendar" class="view-container view">
+        <div class="gantt-toolbar">
+            <div class="filter-bar">
+                <button class="mini-btn" onclick="expandAll()">すべて展開</button>
+                <button class="mini-btn" onclick="collapseAll()">すべて折りたたむ</button>
+                <button class="mini-btn active" id="toggleDepBtn" onclick="toggleDepLines()">依存関係線: ON</button>
+                <select id="ganttZoom" class="input-glow" onchange="renderGantt()">
+                    <option value="3">表示倍率: 広域 (3px/日)</option>
+                    <option value="5" selected>表示倍率: 標準 (5px/日)</option>
+                    <option value="9">表示倍率: 詳細 (9px/日)</option>
+                </select>
+            </div>
+            <div class="gantt-legend">
+                <span><i class="legend-dot" style="background:var(--neon-purple);"></i>Level 1</span>
+                <span><i class="legend-dot" style="background:var(--neon-blue);"></i>通常タスク</span>
+                <span><i class="legend-dot" style="background:var(--neon-amber);"></i>期限間近</span>
+                <span><i class="legend-dot" style="background:var(--neon-red);"></i>期限超過</span>
+                <span><i class="legend-dot" style="background:var(--neon-green);"></i>TODAY</span>
+            </div>
+        </div>
+        <div class="gantt-wrapper">
+            <div class="gantt-labels" id="gantt-labels"></div>
+            <div class="gantt-timeline-container" id="gantt-scroll" onscroll="syncScroll()">
+                <div class="gantt-timeline" id="gantt-timeline"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let tasks = {json_data};
+        let collapsedNodes = new Set();
+        let isFiltering = false;
+        let showDepLines = true;
+
+        // 今日の日付（00:00:00基準）
+        const now = new Date();
+        const todayDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        const todayStr = `${{todayDate.getFullYear()}}-${{String(todayDate.getMonth() + 1).padStart(2, '0')}}-${{String(todayDate.getDate()).padStart(2, '0')}}`;
+
+        function parseLocalDate(isoStr) {{
+            if (!isoStr) return null;
+            const parts = isoStr.split('-');
+            if (parts.length !== 3) return null;
+            return new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10));
+        }}
+
+        function initData() {{
+            document.getElementById('todayDisplay').textContent = `TODAY: ${{todayStr}}`;
+
+            // PHASE PROGRESS: Level 1タスクの進捗を配下タスクの平均から自動計算
+            const topLvlStats = {{}};
+            tasks.forEach(t => {{
+                if (t.level === 1) topLvlStats[t.id] = {{ sum: 0, count: 0 }};
+            }});
+
+            tasks.forEach(t => {{
+                if (t.level > 1 && t.top_parent_id && topLvlStats[t.top_parent_id]) {{
+                    topLvlStats[t.top_parent_id].sum += parseFloat(t.progress || 0);
+                    topLvlStats[t.top_parent_id].count++;
+                }}
+            }});
+
+            tasks.forEach(t => {{
+                if (t.level === 1 && topLvlStats[t.id].count > 0) {{
+                    t.progress = topLvlStats[t.id].sum / topLvlStats[t.id].count;
+                }}
+            }});
+
+            // リソースフィルター選択肢
+            const resources = [...new Set(tasks.map(t => t.resource).filter(r => r))];
+            const resSelect = document.getElementById('resourceFilter');
+            resources.forEach(r => {{
+                const opt = document.createElement('option');
+                opt.value = r;
+                opt.textContent = r;
+                resSelect.appendChild(opt);
+            }});
+        }}
+
+        function getAlertInfo(t) {{
+            // 完了済み（100%以上）はアラート対象外
+            if (parseFloat(t.progress || 0) >= 0.999) return null;
+
+            const threshold = parseInt(document.getElementById('alertThreshold').value, 10);
+            const basis = document.getElementById('alertDateBasis').value;
+
+            let targetStr = '';
+            let basisLabel = '';
+            if (basis === 'deadline_only') {{
+                targetStr = t.deadline;
+                basisLabel = '期限';
+            }} else {{
+                if (t.deadline) {{
+                    targetStr = t.deadline;
+                    basisLabel = '期限';
+                }} else if (t.end) {{
+                    targetStr = t.end;
+                    basisLabel = '終了日';
+                }}
+            }}
+
+            const targetDate = parseLocalDate(targetStr);
+            if (!targetDate) return null;
+
+            const diffDays = Math.round((targetDate - todayDate) / (1000 * 60 * 60 * 24));
+            if (diffDays < 0) {{
+                return {{ type: 'overdue', diffDays, targetStr, basisLabel, label: `${{Math.abs(diffDays)}}日超過` }};
+            }} else if (diffDays <= threshold) {{
+                const dayText = diffDays === 0 ? '本日期限' : `あと${{diffDays}}日`;
+                return {{ type: 'soon', diffDays, targetStr, basisLabel, label: dayText }};
+            }}
+            return null;
+        }}
+
+        function renderAlerts() {{
+            const container = document.getElementById('alertListContainer');
+            const summaryContainer = document.getElementById('alertSummaryBadges');
+
+            const alerted = [];
+            tasks.forEach(t => {{
+                const info = getAlertInfo(t);
+                if (info) alerted.push({{ task: t, info }});
+            }});
+
+            // 超過日数が多い順・残り日数が少ない順にソート
+            alerted.sort((a, b) => a.info.diffDays - b.info.diffDays);
+
+            const overdueCount = alerted.filter(a => a.info.type === 'overdue').length;
+            const soonCount = alerted.filter(a => a.info.type === 'soon').length;
+
+            if (alerted.length === 0) {{
+                summaryContainer.innerHTML = `<span class="alert-count-badge badge-ok">ALERT: 0件 (問題なし)</span>`;
+                container.innerHTML = `<div style="font-size:0.82rem; color:var(--text-muted); padding:4px 0;">現在、期限超過または指定日数以内に期限を迎える未完了タスクはありません。</div>`;
+                return;
+            }}
+
+            summaryContainer.innerHTML = `
+                <span class="alert-count-badge badge-overdue">期限超過: ${{overdueCount}}件</span>
+                <span class="alert-count-badge badge-soon">期限間近: ${{soonCount}}件</span>
+            `;
+
+            let html = '';
+            alerted.forEach(({{ task, info }}) => {{
+                const isOverdue = info.type === 'overdue';
+                const cardClass = isOverdue ? 'alert-card overdue' : 'alert-card';
+                const statusColor = isOverdue ? 'var(--neon-red)' : 'var(--neon-amber)';
+                const prog = (parseFloat(task.progress || 0) * 100).toFixed(0);
+
+                html += `
+                    <div class="${{cardClass}}" onclick="jumpToTask('${{task.id}}')">
+                        <div class="alert-card-top">
+                            <span style="color:var(--text-muted);">ID: ${{task.id}}</span>
+                            <span style="color:${{statusColor}}; font-weight:bold;">[${{info.label}}]</span>
+                        </div>
+                        <div class="alert-card-name" title="${{task.name}}">${{task.name}}</div>
+                        <div class="alert-card-meta">
+                            <span>${{info.basisLabel}}: ${{info.targetStr}}</span>
+                            <span>進捗: ${{prog}}%</span>
+                        </div>
+                    </div>
+                `;
+            }});
+            container.innerHTML = html;
+        }}
+
+        function jumpToTask(taskId) {{
+            // 親階層を展開して該当行へスクロール
+            let curr = tasks.find(x => x.id === taskId);
+            while (curr && curr.parent_id) {{
+                collapsedNodes.delete(curr.parent_id);
+                curr = tasks.find(x => x.id === curr.parent_id);
+            }}
+            renderTable();
+            const row = document.getElementById(`task-row-${{taskId}}`);
+            if (row) {{
+                row.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+                row.classList.remove('flash');
+                void row.offsetWidth;
+                row.classList.add('flash');
+            }}
+        }}
+
+        function refreshAlertsAndTable() {{
+            renderAlerts();
+            renderTable();
+            if (document.getElementById('view-calendar').classList.contains('active')) {{
+                renderGantt();
+            }}
+        }}
+
+        function switchTab(viewId, btnEl) {{
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+
+            btnEl.classList.add('active');
+            document.getElementById('view-' + viewId).classList.add('active');
+
+            if (viewId === 'calendar') {{
+                renderGantt();
+            }}
+        }}
+
+        function toggleCollapse(id) {{
+            if (isFiltering && document.getElementById('view-dashboard').classList.contains('active')) return;
+            if (collapsedNodes.has(id)) collapsedNodes.delete(id);
+            else collapsedNodes.add(id);
+
+            renderTable();
+            if (document.getElementById('view-calendar').classList.contains('active')) {{
+                renderGantt();
+            }}
+        }}
+
+        function expandAll() {{
+            collapsedNodes.clear();
+            renderTable();
+            if (document.getElementById('view-calendar').classList.contains('active')) {{
+                renderGantt();
+            }}
+        }}
+
+        function collapseAll() {{
+            tasks.forEach(t => {{
+                if (t.has_children) collapsedNodes.add(t.id);
+            }});
+            renderTable();
+            if (document.getElementById('view-calendar').classList.contains('active')) {{
+                renderGantt();
+            }}
+        }}
+
+        function toggleDepLines() {{
+            showDepLines = !showDepLines;
+            const btn = document.getElementById('toggleDepBtn');
+            btn.textContent = `依存関係線: ${{showDepLines ? 'ON' : 'OFF'}}`;
+            btn.classList.toggle('active', showDepLines);
+            renderGantt();
+        }}
+
+        function applyFilter() {{
+            const txt = document.getElementById('searchInput').value.toLowerCase();
+            const res = document.getElementById('resourceFilter').value;
+            const alertOnly = document.getElementById('alertOnlyCheck').checked;
+            isFiltering = (txt !== '' || res !== '' || alertOnly);
+            renderTable();
+        }}
+
+        function isTaskHiddenByCollapse(t) {{
+            let curr = tasks.find(x => x.id === t.parent_id);
+            while (curr) {{
+                if (collapsedNodes.has(curr.id)) return true;
+                curr = tasks.find(x => x.id === curr.parent_id);
+            }}
+            return false;
+        }}
+
+        function renderDashboard() {{
+            const lvl1Tasks = tasks.filter(t => t.level === 1);
+            const avgProgress = lvl1Tasks.length
+                ? (lvl1Tasks.reduce((s, t) => s + parseFloat(t.progress || 0), 0) / lvl1Tasks.length) * 100
+                : 0;
+
+            const radius = 56;
+            const circumference = 2 * Math.PI * radius;
+            const offset = circumference - (avgProgress / 100) * circumference;
+
+            document.getElementById('pie-chart-container').innerHTML = `
+                <svg width="150" height="150" viewBox="0 0 140 140">
+                    <circle cx="70" cy="70" r="${{radius}}" fill="none" stroke="rgba(255,255,255,0.06)" stroke-width="12" />
+                    <circle cx="70" cy="70" r="${{radius}}" fill="none" stroke="#00f3ff" stroke-width="12"
+                            stroke-dasharray="${{circumference}}" stroke-dashoffset="${{offset}}"
+                            stroke-linecap="round" transform="rotate(-90 70 70)" style="filter: drop-shadow(0 0 8px #00f3ff);" />
+                    <text x="70" y="77" text-anchor="middle" fill="#e2e8f0" font-size="22" font-family="monospace" font-weight="bold">${{avgProgress.toFixed(1)}}%</text>
+                </svg>
+            `;
+
+            let html = '';
+            lvl1Tasks.forEach(t => {{
+                const p = (parseFloat(t.progress || 0) * 100).toFixed(0);
+                html += `
+                    <div class="bar-item">
+                        <div class="bar-label" title="${{t.name}}">${{t.name}}</div>
+                        <div class="bar-track">
+                            <div class="bar-fill" style="width: ${{p}}%"></div>
+                        </div>
+                        <div class="bar-percent">${{p}}%</div>
+                    </div>`;
+            }});
+            document.getElementById('bar-chart-container').innerHTML = html;
+        }}
+
+        function renderTable() {{
+            const tbody = document.querySelector('#wbs-table tbody');
+            const txt = document.getElementById('searchInput').value.toLowerCase();
+            const res = document.getElementById('resourceFilter').value;
+            const alertOnly = document.getElementById('alertOnlyCheck').checked;
+
+            let visibleSet = new Set();
+            if (isFiltering) {{
+                tasks.forEach(t => {{
+                    let match = true;
+                    if (txt && !t.name.toLowerCase().includes(txt) && !String(t.id).includes(txt)) match = false;
+                    if (res && t.resource !== res) match = false;
+                    if (alertOnly && !getAlertInfo(t)) match = false;
+
+                    if (match) {{
+                        visibleSet.add(t.id);
+                        let curr = tasks.find(x => x.id === t.parent_id);
+                        while (curr) {{
+                            visibleSet.add(curr.id);
+                            curr = tasks.find(x => x.id === curr.parent_id);
+                        }}
+                    }}
+                }});
+            }}
+
+            let html = '';
+            tasks.forEach(t => {{
+                if (isFiltering) {{
+                    if (!visibleSet.has(t.id)) return;
+                }} else {{
+                    if (isTaskHiddenByCollapse(t)) return;
+                }}
+
+                const pad = (t.level - 1) * 18;
+                const prog = (parseFloat(t.progress || 0) * 100).toFixed(0);
+                const alertInfo = getAlertInfo(t);
+
+                let rowClasses = [];
+                if (t.level === 1) rowClasses.push('lvl-1');
+                if (alertInfo) rowClasses.push(alertInfo.type === 'overdue' ? 'row-overdue' : 'row-soon');
+
+                let toggleIcon = '<span style="display:inline-block; width:22px;"></span>';
+                if (t.has_children) {{
+                    const icon = collapsedNodes.has(t.id) ? '+' : '-';
+                    toggleIcon = `<span class="toggle-btn" onclick="toggleCollapse('${{t.id}}')">[${{icon}}]</span>`;
+                }}
+
+                let alertPill = '';
+                if (alertInfo) {{
+                    const pillClass = alertInfo.type === 'overdue' ? 'pill-overdue' : 'pill-soon';
+                    alertPill = `<span class="status-pill ${{pillClass}}">${{alertInfo.label}}</span>`;
+                }}
+
+                const predText = t.predecessors.length ? `先:${{t.predecessors.join(',')}}` : '';
+                const succText = t.successors.length ? `後:${{t.successors.join(',')}}` : '';
+                const depDisplay = [predText, succText].filter(Boolean).join(' / ') || '-';
+
+                html += `
+                    <tr id="task-row-${{t.id}}" class="${{rowClasses.join(' ')}}">
+                        <td style="color: var(--text-muted); font-family:monospace;">${{t.id}}</td>
+                        <td style="padding-left: ${{pad + 8}}px;">
+                            ${{toggleIcon}}
+                            ${{t.name}}
+                            ${{alertPill}}
+                        </td>
+                        <td>
+                            <div style="display:flex; align-items:center; gap:8px;">
+                                <div style="width:55px; background:rgba(255,255,255,0.1); height:6px; border-radius:3px;">
+                                    <div style="height:100%; width:${{prog}}%; background:var(--neon-green); box-shadow:0 0 5px var(--neon-green); border-radius:3px;"></div>
+                                </div>
+                                <span style="font-family:monospace; font-size:0.8rem;">${{prog}}%</span>
+                            </div>
+                        </td>
+                        <td style="font-size:0.8rem; color:var(--text-muted);">${{t.duration || '-'}} / ${{t.work_hours || '-'}}</td>
+                        <td style="font-family:monospace;">${{t.start || '-'}}</td>
+                        <td style="font-family:monospace;">${{t.end || '-'}}</td>
+                        <td style="font-family:monospace; color:${{t.deadline ? 'var(--text-main)' : 'var(--text-muted)'}};">${{t.deadline || 'N/A'}}</td>
+                        <td>${{t.resource || '-'}}</td>
+                        <td style="font-size:0.78rem; color:var(--text-muted); font-family:monospace;">${{depDisplay}}</td>
+                    </tr>
+                `;
+            }});
+            tbody.innerHTML = html;
+        }}
+
+        function renderGantt() {{
+            const labelsContainer = document.getElementById('gantt-labels');
+            const timelineContainer = document.getElementById('gantt-timeline');
+
+            const validTasks = tasks.filter(t => t.start && t.end);
+            if (validTasks.length === 0) {{
+                labelsContainer.innerHTML = '<div style="padding:15px;">日付データがありません</div>';
+                return;
+            }}
+
+            const allTimes = validTasks.flatMap(t => [parseLocalDate(t.start).getTime(), parseLocalDate(t.end).getTime()]);
+            allTimes.push(todayDate.getTime());
+
+            const dayMs = 24 * 60 * 60 * 1000;
+            const minDate = Math.min(...allTimes) - dayMs * 10;
+            const maxDate = Math.max(...allTimes) + dayMs * 18;
+
+            const totalDays = Math.ceil((maxDate - minDate) / dayMs);
+            const dayWidth = parseInt(document.getElementById('ganttZoom').value, 10) || 5;
+            const rowHeight = 34;
+
+            // 年月ヘッダー生成
+            let headerHtml = `<div class="g-header" style="width:${{totalDays * dayWidth}}px; height: 35px;">`;
+            let currentMonth = '';
+            let monthDays = 0;
+
+            for (let i = 0; i < totalDays; i++) {{
+                const d = new Date(minDate + i * dayMs);
+                const m = `${{d.getFullYear()}}-${{String(d.getMonth() + 1).padStart(2, '0')}}`;
+                if (m !== currentMonth) {{
+                    if (currentMonth !== '') {{
+                        headerHtml += `<div class="g-month" style="width:${{monthDays * dayWidth}}px">${{currentMonth}}</div>`;
+                    }}
+                    currentMonth = m;
+                    monthDays = 1;
+                }} else {{
+                    monthDays++;
+                }}
+            }}
+            headerHtml += `<div class="g-month" style="width:${{monthDays * dayWidth}}px">${{currentMonth}}</div></div>`;
+
+            // 折りたたみ状態を反映した表示対象タスクリスト
+            const visibleTasks = tasks.filter(t => !isTaskHiddenByCollapse(t));
+
+            let labelsHtml = `<div style="height:35px; border-bottom:1px solid rgba(0,243,255,0.25); background:rgba(10,18,38,0.98); display:flex; align-items:center; padding-left:12px; font-size:0.8rem; color:var(--neon-blue); letter-spacing:1px;">TASK HIERARCHY</div>`;
+            let barsHtml = headerHtml;
+
+            // TODAYラインの描画
+            const todayX = ((todayDate.getTime() - minDate) / dayMs) * dayWidth;
+            barsHtml += `<div class="g-today-line" style="left:${{todayX}}px;"><span class="g-today-label">TODAY</span></div>`;
+
+            let yOffset = 35;
+            const barPosMap = {{}};
+
+            visibleTasks.forEach(t => {{
+                const pad = (t.level - 1) * 15;
+                const color = t.level === 1 ? 'var(--neon-blue)' : 'var(--text-main)';
+                const fontWeight = t.level === 1 ? 'bold' : 'normal';
+
+                let toggleIcon = '<span style="display:inline-block; width:20px; flex-shrink:0;"></span>';
+                if (t.has_children) {{
+                    const icon = collapsedNodes.has(t.id) ? '+' : '-';
+                    toggleIcon = `<span class="toggle-btn" style="flex-shrink:0;" onclick="toggleCollapse('${{t.id}}')">[${{icon}}]</span>`;
+                }}
+
+                labelsHtml += `
+                    <div class="g-row-label" style="height:${{rowHeight}}px; padding-left:${{pad + 8}}px; color:${{color}}; font-weight:${{fontWeight}};" title="[${{t.id}}] ${{t.name}}">
+                        ${{toggleIcon}}
+                        <span style="overflow:hidden; text-overflow:ellipsis;">${{t.name}}</span>
+                    </div>`;
+
+                barsHtml += `<div class="g-row-bg" style="top:${{yOffset}}px; height:${{rowHeight}}px;"></div>`;
+
+                if (t.start && t.end) {{
+                    const sTime = parseLocalDate(t.start).getTime();
+                    const eTime = parseLocalDate(t.end).getTime();
+                    const startX = ((sTime - minDate) / dayMs) * dayWidth;
+                    const w = Math.max(((eTime - sTime) / dayMs) * dayWidth, 6);
+                    const centerY = yOffset + rowHeight / 2;
+
+                    barPosMap[t.id] = {{ startX, endX: startX + w, centerY }};
+
+                    const alertInfo = getAlertInfo(t);
+                    let barColor = t.level === 1 ? 'var(--neon-purple)' : 'var(--neon-blue)';
+                    let textColor = t.level === 1 ? '#fff' : '#000';
+                    let glowColor = barColor;
+
+                    if (alertInfo) {{
+                        if (alertInfo.type === 'overdue') {{
+                            barColor = 'var(--neon-red)';
+                            textColor = '#fff';
+                            glowColor = 'var(--neon-red)';
+                        }} else {{
+                            barColor = 'var(--neon-amber)';
+                            textColor = '#000';
+                            glowColor = 'var(--neon-amber)';
+                        }}
+                    }}
+
+                    const prog = (parseFloat(t.progress || 0) * 100).toFixed(0);
+                    barsHtml += `
+                        <div class="g-bar"
+                             data-task-id="${{t.id}}"
+                             onmouseenter="highlightDeps('${{t.id}}')"
+                             onmouseleave="clearDepHighlight()"
+                             style="top:${{yOffset + 8}}px; left:${{startX}}px; width:${{w}}px; background:${{barColor}}; color:${{textColor}}; box-shadow: 0 0 8px ${{glowColor}};"
+                             title="[ID:${{t.id}}] ${{t.name}} (${{t.start}} 〜 ${{t.end}} / 進捗:${{prog}}%)">
+                            ${{w > 28 ? prog + '%' : ''}}
+                        </div>`;
+                }}
+                yOffset += rowHeight;
+            }});
+
+            // 先行・後続タスクの依存関係線（SVG）生成
+            if (showDepLines) {{
+                const edgeSet = new Set();
+                const edges = [];
+
+                visibleTasks.forEach(t => {{
+                    (t.predecessors || []).forEach(predId => {{
+                        const key = `${{predId}}->${{t.id}}`;
+                        if (!edgeSet.has(key)) {{
+                            edgeSet.add(key);
+                            edges.push({{ from: predId, to: t.id }});
+                        }}
+                    }});
+                    (t.successors || []).forEach(succId => {{
+                        const key = `${{t.id}}->${{succId}}`;
+                        if (!edgeSet.has(key)) {{
+                            edgeSet.add(key);
+                            edges.push({{ from: t.id, to: succId }});
+                        }}
+                    }});
+                }});
+
+                let pathsHtml = '';
+                edges.forEach(edge => {{
+                    const fromPos = barPosMap[edge.from];
+                    const toPos = barPosMap[edge.to];
+                    if (!fromPos || !toPos) return;
+
+                    const x1 = fromPos.endX;
+                    const y1 = fromPos.centerY;
+                    const x2 = toPos.startX;
+                    const y2 = toPos.centerY;
+                    const gap = 10;
+
+                    let d = '';
+                    if (x2 >= x1 + gap) {{
+                        // 順方向: 右へ少し出てから縦線で降り/上がり、後続バー左端へ接続
+                        const midX = x1 + gap;
+                        d = `M ${{x1}} ${{y1}} L ${{midX}} ${{y1}} L ${{midX}} ${{y2}} L ${{x2}} ${{y2}}`;
+                    }} else {{
+                        // 逆方向または重複: 一旦右へ出て中間Yを通って左へ回り込み縦線で接続
+                        const outX = x1 + gap;
+                        const inX = Math.max(0, x2 - gap);
+                        const midY = y1 + (y2 > y1 ? rowHeight / 2 : -rowHeight / 2);
+                        d = `M ${{x1}} ${{y1}} L ${{outX}} ${{y1}} L ${{outX}} ${{midY}} L ${{inX}} ${{midY}} L ${{inX}} ${{y2}} L ${{x2}} ${{y2}}`;
+                    }}
+
+                    pathsHtml += `<path class="dep-path" data-from="${{edge.from}}" data-to="${{edge.to}}" d="${{d}}" marker-end="url(#dep-arrow)" />`;
+                }});
+
+                const totalWidth = totalDays * dayWidth;
+                barsHtml += `
+                    <svg class="dep-svg" width="${{totalWidth}}" height="${{yOffset}}">
+                        <defs>
+                            <marker id="dep-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+                                <path d="M 0 1 L 7 4 L 0 7 z" fill="#00f3ff" />
+                            </marker>
+                        </defs>
+                        ${{pathsHtml}}
+                    </svg>`;
+            }}
+
+            labelsContainer.innerHTML = labelsHtml;
+            timelineContainer.innerHTML = barsHtml;
+            timelineContainer.style.width = (totalDays * dayWidth) + 'px';
+            timelineContainer.style.height = yOffset + 'px';
+        }}
+
+        function highlightDeps(taskId) {{
+            const paths = document.querySelectorAll('.dep-path');
+            if (!paths.length) return;
+            paths.forEach(p => {{
+                if (p.dataset.from === taskId || p.dataset.to === taskId) {{
+                    p.classList.add('highlighted');
+                    p.classList.remove('dimmed');
+                }} else {{
+                    p.classList.add('dimmed');
+                    p.classList.remove('highlighted');
+                }}
+            }});
+        }}
+
+        function clearDepHighlight() {{
+            document.querySelectorAll('.dep-path').forEach(p => {{
+                p.classList.remove('highlighted', 'dimmed');
+            }});
+        }}
+
+        function syncScroll() {{
+            const timeline = document.getElementById('gantt-scroll');
+            const labels = document.getElementById('gantt-labels');
+            labels.scrollTop = timeline.scrollTop;
+        }}
+
+        document.addEventListener('DOMContentLoaded', () => {{
+            initData();
+            renderAlerts();
+            renderDashboard();
+            renderTable();
+        }});
+    </script>
+</body>
+</html>"""
+
+        output_dir = os.path.dirname(os.path.abspath(file_path))
+        output_file = os.path.join(output_dir, 'cyber_wbs_dashboard.html')
+
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+
+        print(f"✅ 作成完了: {output_file}")
+        try:
+            messagebox.showinfo("完了", f"ダッシュボードの作成が完了しました。\n\n保存先:\n{output_file}")
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f"❌ エラーが発生しました: {e}")
+        try:
+            messagebox.showerror("エラー", f"処理中にエラーが発生しました:\n{e}")
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
