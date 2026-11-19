@@ -1,0 +1,295 @@
+import difflib
+import os
+import re
+import shutil
+import tkinter as tk
+from datetime import datetime
+from pathlib import Path
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+import xml.etree.ElementTree as ET
+
+# DITAで使用される標準名前空間のプレフィックス維持
+ET.register_namespace("ditaarch", "http://dita.oasis-open.org/architecture/2005/")
+ET.register_namespace("xsi", "http://www.w3.org/2001/XMLSchema-instance")
+
+# <prolog> を挿入すべき位置の基準となる後続要素（DITA DTD構造準拠）
+BODY_AND_AFTER_TAGS = {
+    "body",
+    "taskbody",
+    "conbody",
+    "refbody",
+    "glossbody",
+    "related-links",
+    "topic",
+    "task",
+    "concept",
+    "reference",
+}
+
+# 比較の最小単位として扱うブロック・リーフ要素
+# ※ table / tgroup / thead / tbody / row はコンテナとして扱い、自身の属性比較＋子要素の再帰比較を行う
+LEAF_COMPARE_TAGS = {
+    "title",
+    "navtitle",
+    "searchtitle",
+    "shortdesc",
+    "p",
+    "li",
+    "cmd",
+    "info",
+    "stepresult",
+    "stepxmp",
+    "choicetable",
+    "choption",
+    "chdesc",
+    "entry",
+    "dt",
+    "dd",
+    "note",
+    "codeblock",
+    "pre",
+    "lq",
+    "alt",
+    "term",
+    "keyword",
+    "image",
+    "colspec",
+    "clasped",
+    "xref",
+    "object",
+    "param",
+}
+
+# DITA DTD上、status / rev 属性を直接持てない要素（コメント記録＋親要素への属性付与で対応）
+NO_REV_STATUS_TAGS = {
+    "colspec",
+    "clasped",
+    "param",
+}
+
+# 差分比較から除外する履歴管理用属性
+HISTORY_ATTRS = {"rev", "status"}
+
+
+def extract_xml_header(raw_text: str) -> str:
+    """元のDITAファイルから <?xml ...?> と <!DOCTYPE ...> のヘッダ部分を抽出する"""
+    pattern = r"^(\s*(?:<\?xml[^?]*\?>\s*)?(?:<!DOCTYPE(?:\[[^\]]*\]|[^>])*>\s*)?)"
+    match = re.match(pattern, raw_text, flags=re.DOTALL | re.IGNORECASE)
+    if match and match.group(1).strip():
+        return match.group(1)
+    return '<?xml version="1.0" encoding="UTF-8"?>\n'
+
+
+def normalize_text(elem: ET.Element) -> str:
+    """要素配下の全テキストを正規化して取得（改行・連続空白の揺れを吸収）"""
+    raw = "".join(elem.itertext())
+    return re.sub(r"\s+", " ", raw).strip()
+
+
+def truncate_text(text: str, max_len: int = 45) -> str:
+    """履歴表示用に長い文字列を省略する"""
+    if not text:
+        return ""
+    return text if len(text) <= max_len else text[:max_len] + "..."
+
+
+def get_comparable_attrs(elem: ET.Element) -> dict[str, str]:
+    """履歴用属性（rev, status）を除いた比較対象属性辞書を返す"""
+    return {k: v for k, v in elem.attrib.items() if k not in HISTORY_ATTRS}
+
+
+def format_attrs_brief(elem: ET.Element) -> str:
+    """要素の主要属性を簡潔な文字列表現にする（テキストを持たないimage/colspec等の要約用）"""
+    attrs = get_comparable_attrs(elem)
+    if not attrs:
+        return ""
+    priority_keys = ["href", "keyref", "conref", "scale", "cols", "colname", "colwidth", "id"]
+    ordered_keys = [k for k in priority_keys if k in attrs] + [
+        k for k in sorted(attrs) if k not in priority_keys
+    ]
+    parts = [f'{k}="{attrs[k]}"' for k in ordered_keys[:4]]
+    suffix = ", ..." if len(ordered_keys) > 4 else ""
+    return " ".join(parts) + suffix
+
+
+def describe_element_content(elem: ET.Element) -> str:
+    """要素の内容（テキストまたは属性）を人間が読める要約文字列にする"""
+    txt = truncate_text(normalize_text(elem))
+    attr_info = format_attrs_brief(elem)
+    if txt and attr_info:
+        return f"「{txt}」 ({attr_info})"
+    if txt:
+        return f"「{txt}」"
+    if attr_info:
+        return f"({attr_info})"
+    return "(空要素)"
+
+
+def diff_attributes(before_elem: ET.Element, after_elem: ET.Element) -> list[str]:
+    """2つの要素の属性差分（追加・削除・値変更）をリストで返す"""
+    b_attrs = get_comparable_attrs(before_elem)
+    a_attrs = get_comparable_attrs(after_elem)
+    all_keys = sorted(set(b_attrs.keys()) | set(a_attrs.keys()))
+
+    diffs: list[str] = []
+    for k in all_keys:
+        if k not in b_attrs:
+            diffs.append(f'{k}="(なし)" → {k}="{a_attrs[k]}"')
+        elif k not in a_attrs:
+            diffs.append(f'{k}="{b_attrs[k]}" → {k}="(削除)"')
+        elif b_attrs[k] != a_attrs[k]:
+            diffs.append(f'{k}="{b_attrs[k]}" → {k}="{a_attrs[k]}"')
+    return diffs
+
+
+def collect_descendant_attr_diffs(
+    before_elem: ET.Element, after_elem: ET.Element
+) -> list[str]:
+    """リーフブロック（pやentry等）内部にネストされた子孫要素（image等）の属性変更も検出する"""
+    b_desc = [e for e in before_elem.iter() if e is not before_elem and isinstance(e.tag, str)]
+    a_desc = [e for e in after_elem.iter() if e is not after_elem and isinstance(e.tag, str)]
+    if not b_desc and not a_desc:
+        return []
+
+    diffs: list[str] = []
+    pair_count = min(len(b_desc), len(a_desc))
+    for i in range(pair_count):
+        if b_desc[i].tag == a_desc[i].tag:
+            sub_diffs = diff_attributes(b_desc[i], a_desc[i])
+            if sub_diffs:
+                diffs.append(f"子要素[{a_desc[i].tag}] {', '.join(sub_diffs)}")
+    return diffs
+
+
+def element_signature(elem: ET.Element) -> str:
+    """要素の比較用シグネチャ（タグ名・全属性・正規化テキスト・子孫構造）を生成"""
+    attrs = sorted(get_comparable_attrs(elem).items())
+    attr_str = ",".join(f"{k}={v}" for k, v in attrs)
+    text_str = normalize_text(elem)
+    desc_sig = ",".join(
+        f"{c.tag}:{sorted(get_comparable_attrs(c).items())}"
+        for c in elem.iter()
+        if c is not elem and isinstance(c.tag, str)
+    )
+    return f"{elem.tag}[{attr_str}]|{text_str}|({desc_sig})"
+
+
+def is_atomic_element(elem: ET.Element) -> bool:
+    """子要素単位で再帰比較するか、その要素単位で差分判定するかを返す"""
+    if elem.tag in LEAF_COMPARE_TAGS:
+        return True
+    child_elems = [c for c in elem if isinstance(c.tag, str)]
+    return len(child_elems) == 0
+
+
+def mark_element_changed(
+    elem: ET.Element,
+    status: str,
+    rev_value: str,
+    parent_elem: ET.Element | None = None,
+) -> None:
+    """DTD制約を考慮して要素（または親要素）に status / rev 属性を付与する"""
+    if elem.tag in NO_REV_STATUS_TAGS:
+        if parent_elem is not None and parent_elem.tag not in NO_REV_STATUS_TAGS:
+            if "status" not in parent_elem.attrib:
+                parent_elem.set("status", "changed")
+            parent_elem.set("rev", rev_value)
+        return
+
+    elem.set("status", status)
+    elem.set("rev", rev_value)
+
+
+def build_change_detail(before_elem: ET.Element, after_elem: ET.Element) -> list[str]:
+    """変更前後の2要素から、属性変更とテキスト変更の詳細メッセージを作成する"""
+    details: list[str] = []
+
+    # 1. 要素自身の属性変更（例: scale="50" -> scale="80", cols="3" -> cols="4"）
+    attr_diffs = diff_attributes(before_elem, after_elem)
+    if attr_diffs:
+        details.append(f"[{after_elem.tag}] 属性変更: {', '.join(attr_diffs)}")
+
+    # 2. リーフ要素内の子孫要素（例: <p>内の<image scale="...">）の属性変更
+    if is_atomic_element(after_elem):
+        desc_attr_diffs = collect_descendant_attr_diffs(before_elem, after_elem)
+        for d in desc_attr_diffs:
+            details.append(f"[{after_elem.tag}] {d}")
+
+        # 3. テキスト内容の変更
+        b_text = normalize_text(before_elem)
+        a_text = normalize_text(after_elem)
+        if b_text != a_text:
+            details.append(
+                f"[{after_elem.tag}] 「{truncate_text(b_text) or '(空)'}」 → 「{truncate_text(a_text) or '(空)'}」"
+            )
+
+    return details
+
+
+def compare_and_mark_elements(
+    before_elem: ET.Element,
+    after_elem: ET.Element,
+    author: str,
+    timestamp: str,
+    changes_log: list[str],
+    parent_after: ET.Element | None = None,
+) -> list[str]:
+    """
+    2つのXML要素を再帰的に比較し、変更箇所へ属性とコメントを付与する。
+    戻り値として、after_elem 自体の直前に親要素が挿入すべきコメント文字列リストを返す。
+    """
+    rev_value = f"{timestamp} ({author})"
+    self_comments: list[str] = []
+
+    # リーフ/ブロック単位の要素比較
+    if is_atomic_element(before_elem) or is_atomic_element(after_elem):
+        if element_signature(before_elem) != element_signature(after_elem):
+            details = build_change_detail(before_elem, after_elem)
+            if not details:
+                details = [
+                    f"[{after_elem.tag}] {describe_element_content(before_elem)} → {describe_element_content(after_elem)}"
+                ]
+            mark_element_changed(after_elem, "changed", rev_value, parent_after)
+            for summary in details:
+                changes_log.append(summary)
+                self_comments.append(
+                    f" [変更履歴] {timestamp} | 変更者: {author} | {summary} "
+                )
+        return self_comments
+
+    # コンテナ要素（table, tgroup, tbody, row, section, ul, steps 等）自身の属性変更チェック
+    self_attr_diffs = diff_attributes(before_elem, after_elem)
+    if self_attr_diffs:
+        summary = f"[{after_elem.tag}] 属性変更: {', '.join(self_attr_diffs)}"
+        mark_element_changed(after_elem, "changed", rev_value, parent_after)
+        changes_log.append(summary)
+        self_comments.append(
+            f" [変更履歴] {timestamp} | 変更者: {author} | {summary} "
+        )
+
+    # コンテナ要素の子要素リストを SequenceMatcher で比較
+    b_children = [c for c in list(before_elem) if isinstance(c.tag, str)]
+    a_children = [c for c in list(after_elem) if isinstance(c.tag, str)]
+
+    b_sigs = [element_signature(c) for c in b_children]
+    a_sigs = [element_signature(c) for c in a_children]
+
+    matcher = difflib.SequenceMatcher(None, b_sigs, a_sigs, autojunk=False)
+
+    # 挿入するコメントの記録: (対象after子要素のオブジェクト, コメント文字列)
+    comments_before_elem: list[tuple[ET.Element, str]] = []
+    # 削除された要素の記録: (挿入基準となるafter子要素またはNone, コメント文字列)
+    deletion_comments: list[tuple[ET.Element | None, str]] = []
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+
+        elif tag == "replace":
+            b_slice = b_children[i1:i2]
+            a_slice = a_children[j1:j2]
+            pair_count = min(len(b_slice), len(a_slice))
+
+            for k in range(pair_count):
+                b_child = b_slice[k]
+                a_
