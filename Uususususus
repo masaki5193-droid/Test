@@ -1,0 +1,769 @@
+import difflib
+import os
+import re
+import shutil
+import tkinter as tk
+from datetime import datetime
+from pathlib import Path
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+import xml.etree.ElementTree as ET
+
+# DITAで使用される標準名前空間のプレフィックス維持
+ET.register_namespace("ditaarch", "http://dita.oasis-open.org/architecture/2005/")
+ET.register_namespace("xsi", "http://www.w3.org/2001/XMLSchema-instance")
+
+
+def get_current_oxy_timestamp() -> str:
+    """Oxygen XML Editor形式の現在時刻タイムスタンプ（例: 20261117T143531+0900）を返す"""
+    now = datetime.now().astimezone()
+    ts = now.strftime("%Y%m%dT%H%M%S%z")
+    if len(ts) == 15:
+        ts += "+0900"
+    return ts
+
+
+def escape_xml_attr(value: str) -> str:
+    """XML属性値・PI属性値用に特殊文字をエスケープする"""
+    escaped = (
+        value.replace("&", "&amp;")
+        .replace('"', "&quot;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\r", "&#13;")
+        .replace("\n", "&#10;")
+    )
+    return escaped.replace("?>", "?&gt;")
+
+
+def make_pi_insert_start(author: str, timestamp: str) -> ET.Element:
+    """<?oxy_insert_start author="..." timestamp="..."?> を生成する"""
+    text = f'author="{escape_xml_attr(author)}" timestamp="{escape_xml_attr(timestamp)}"'
+    return ET.ProcessingInstruction("oxy_insert_start", text)
+
+
+def make_pi_insert_end() -> ET.Element:
+    """<?oxy_insert_end?> を生成する"""
+    return ET.ProcessingInstruction("oxy_insert_end")
+
+
+def make_pi_delete(author: str, timestamp: str, content: str) -> ET.Element:
+    """<?oxy_delete author="..." timestamp="..." content="..."?> を生成する"""
+    text = (
+        f'author="{escape_xml_attr(author)}" '
+        f'timestamp="{escape_xml_attr(timestamp)}" '
+        f'content="{escape_xml_attr(content)}"'
+    )
+    return ET.ProcessingInstruction("oxy_delete", text)
+
+
+def make_pi_attributes(
+    attr_changes: list[tuple[str, str, str | None]],
+    author: str,
+    timestamp: str,
+) -> ET.Element:
+    """
+    <?oxy_attributes ...?> を生成する。
+    attr_changes: [(属性名, "modified"|"inserted"|"deleted", 変更前値またはNone), ...]
+    """
+    parts: list[str] = []
+    esc_author = escape_xml_attr(author)
+    esc_ts = escape_xml_attr(timestamp)
+
+    for attr_name, change_type, old_val in attr_changes:
+        if change_type == "inserted":
+            inner = (
+                f'<change type="inserted" '
+                f'author="{esc_author}" timestamp="{esc_ts}"/>'
+            )
+        else:
+            esc_old = escape_xml_attr(old_val or "")
+            inner = (
+                f'<change type="{change_type}" oldValue="{esc_old}" '
+                f'author="{esc_author}" timestamp="{esc_ts}"/>'
+            )
+        parts.append(f'{attr_name}="{escape_xml_attr(inner)}"')
+
+    return ET.ProcessingInstruction("oxy_attributes", " ".join(parts))
+
+
+def serialize_element_without_tail(elem: ET.Element) -> str:
+    """要素の .tail を含めずに要素自身のXML文字列を取得する"""
+    orig_tail = elem.tail
+    elem.tail = None
+    try:
+        return ET.tostring(elem, encoding="unicode")
+    finally:
+        elem.tail = orig_tail
+
+
+def extract_xml_header(raw_text: str) -> str:
+    """元のDITAファイルから <?xml ...?> と <!DOCTYPE ...> のヘッダ部分を抽出する"""
+    pattern = r"^(\s*(?:<\?xml[^?]*\?>\s*)?(?:<!DOCTYPE(?:\[[^\]]*\]|[^>])*>\s*)?)"
+    match = re.match(pattern, raw_text, flags=re.DOTALL | re.IGNORECASE)
+    if match and match.group(1).strip():
+        return match.group(1)
+    return '<?xml version="1.0" encoding="UTF-8"?>\n'
+
+
+def normalize_text(elem: ET.Element) -> str:
+    """要素配下の全テキストを正規化して取得"""
+    raw = "".join(elem.itertext())
+    return re.sub(r"\s+", " ", raw).strip()
+
+
+def truncate_text(text: str, max_len: int = 40) -> str:
+    """ログ表示用に長い文字列を省略する"""
+    clean = re.sub(r"\s+", " ", text).strip()
+    if not clean:
+        return ""
+    return clean if len(clean) <= max_len else clean[:max_len] + "..."
+
+
+def element_signature(elem: ET.Element) -> str:
+    """要素の比較用シグネチャ（タグ名・全属性・正規化テキスト・子孫構造）を生成"""
+    attrs = sorted(elem.attrib.items())
+    attr_str = ",".join(f"{k}={v}" for k, v in attrs)
+    text_str = normalize_text(elem)
+    desc_sig = ",".join(
+        f"{c.tag}:{sorted(c.attrib.items())}"
+        for c in elem.iter()
+        if c is not elem and isinstance(c.tag, str)
+    )
+    return f"{elem.tag}[{attr_str}]|{text_str}|({desc_sig})"
+
+
+def tokenize_text_for_diff(text: str) -> list[str]:
+    """日本語・英語混在テキストを自然な単語・文節トークンへ分割する"""
+    return re.findall(
+        r"[A-Za-z0-9_.-]+|[\u4E00-\u9FFF]+|[\u3040-\u309F]+|[\u30A0-\u30FF]+|\s+|.",
+        text,
+        flags=re.DOTALL,
+    )
+
+
+def build_inline_text_diff_tokens(
+    old_text: str,
+    new_text: str,
+    author: str,
+    timestamp: str,
+    changes_log: list[str],
+    context_tag: str,
+) -> list[tuple[str, str | ET.Element]]:
+    """
+    2つの文字列を比較し、変更箇所に <?oxy_delete ...?> と
+    <?oxy_insert_start ...?>...<?oxy_insert_end?> を埋め込んだトークン列を返す。
+    """
+    if old_text == new_text:
+        return [("text", new_text)] if new_text else []
+
+    if not old_text.strip() and not new_text.strip():
+        return [("text", new_text)] if new_text else []
+
+    old_tokens = tokenize_text_for_diff(old_text)
+    new_tokens = tokenize_text_for_diff(new_text)
+    matcher = difflib.SequenceMatcher(None, old_tokens, new_tokens, autojunk=False)
+
+    result: list[tuple[str, str | ET.Element]] = []
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        old_chunk = "".join(old_tokens[i1:i2])
+        new_chunk = "".join(new_tokens[j1:j2])
+
+        if tag == "equal":
+            if new_chunk:
+                result.append(("text", new_chunk))
+
+        elif tag == "replace":
+            if not old_chunk.strip() and not new_chunk.strip():
+                if new_chunk:
+                    result.append(("text", new_chunk))
+                continue
+
+            if old_chunk:
+                result.append(("node", make_pi_delete(author, timestamp, old_chunk)))
+            if new_chunk:
+                result.append(("node", make_pi_insert_start(author, timestamp)))
+                result.append(("text", new_chunk))
+                result.append(("node", make_pi_insert_end()))
+
+            changes_log.append(
+                f"[{context_tag}] テキスト変更: 「{truncate_text(old_chunk) or '(空白)'}」 → 「{truncate_text(new_chunk) or '(空白)'}」"
+            )
+
+        elif tag == "delete":
+            if not old_chunk.strip():
+                continue
+            result.append(("node", make_pi_delete(author, timestamp, old_chunk)))
+            changes_log.append(
+                f"[{context_tag}] テキスト削除: 「{truncate_text(old_chunk)}」"
+            )
+
+        elif tag == "insert":
+            if not new_chunk.strip():
+                if new_chunk:
+                    result.append(("text", new_chunk))
+                continue
+            result.append(("node", make_pi_insert_start(author, timestamp)))
+            result.append(("text", new_chunk))
+            result.append(("node", make_pi_insert_end()))
+            changes_log.append(
+                f"[{context_tag}] テキスト追加: 「{truncate_text(new_chunk)}」"
+            )
+
+    return result
+
+
+def diff_attributes(
+    before_elem: ET.Element, after_elem: ET.Element
+) -> tuple[list[tuple[str, str, str | None]], list[str]]:
+    """
+    2つの要素の属性差分を抽出する。
+    戻り値: (PI生成用タプルリスト, ログ出力用文字列リスト)
+    """
+    b_attrs = before_elem.attrib
+    a_attrs = after_elem.attrib
+    all_keys = sorted(set(b_attrs.keys()) | set(a_attrs.keys()))
+
+    pi_changes: list[tuple[str, str, str | None]] = []
+    log_summaries: list[str] = []
+
+    for k in all_keys:
+        if k not in b_attrs:
+            pi_changes.append((k, "inserted", None))
+            log_summaries.append(f'{k}="(なし)" → {k}="{a_attrs[k]}"')
+        elif k not in a_attrs:
+            pi_changes.append((k, "deleted", b_attrs[k]))
+            log_summaries.append(f'{k}="{b_attrs[k]}" → {k}="(削除)"')
+        elif b_attrs[k] != a_attrs[k]:
+            pi_changes.append((k, "modified", b_attrs[k]))
+            log_summaries.append(f'{k}="{b_attrs[k]}" → {k}="{a_attrs[k]}"')
+
+    return pi_changes, log_summaries
+
+
+def tokenize_mixed_content(elem: ET.Element) -> list[tuple[str, str | ET.Element]]:
+    """
+    要素の内部コンテンツ（テキスト＋子要素＋tail）をフラットなトークン列へ分解する。
+    各トークンは ("text", str)、("elem", ET.Element)、または ("node", ET.Element)。
+    """
+    tokens: list[tuple[str, str | ET.Element]] = []
+    if elem.text:
+        tokens.append(("text", elem.text))
+    for child in list(elem):
+        if isinstance(child.tag, str):
+            tokens.append(("elem", child))
+        else:
+            tokens.append(("node", child))
+        if child.tail:
+            tokens.append(("text", child.tail))
+    return tokens
+
+
+def rebuild_mixed_content(
+    elem: ET.Element, tokens: list[tuple[str, str | ET.Element]]
+) -> None:
+    """処理済みのトークン列から要素の .text / 子要素 / .tail を再構築する"""
+    for child in list(elem):
+        elem.remove(child)
+    elem.text = None
+
+    last_node: ET.Element | None = None
+    for kind, val in tokens:
+        if kind == "text":
+            assert isinstance(val, str)
+            if not val:
+                continue
+            if last_node is None:
+                elem.text = (elem.text or "") + val
+            else:
+                last_node.tail = (last_node.tail or "") + val
+        else:
+            assert isinstance(val, ET.Element)
+            val.tail = None
+            elem.append(val)
+            last_node = val
+
+
+def token_signature(token: tuple[str, str | ET.Element]) -> str:
+    """混合コンテンツトークンの比較用シグネチャを返す"""
+    kind, val = token
+    if kind == "text":
+        assert isinstance(val, str)
+        if not val.strip():
+            return "WS"
+        normalized = re.sub(r"\s+", " ", val).strip()
+        return f"TEXT:{normalized}"
+    elif kind == "elem":
+        assert isinstance(val, ET.Element)
+        return f"ELEM:{element_signature(val)}"
+    else:
+        assert isinstance(val, ET.Element)
+        return f"OTHER:{ET.tostring(val, encoding='unicode')}"
+
+
+def compare_and_mark_elements(
+    before_elem: ET.Element,
+    after_elem: ET.Element,
+    author: str,
+    timestamp: str,
+    changes_log: list[str],
+) -> list[ET.Element]:
+    """
+    2つのXML要素を再帰的に比較し、Oxygen XML Editor形式の変更履歴PIを付与する。
+    戻り値: after_elem 自体の直前に挿入すべき処理命令（<?oxy_attributes ...?>）のリスト
+    """
+    pre_pis: list[ET.Element] = []
+
+    # 1. 要素自身の属性変更チェック（scale, cols, colwidth, href, frame 等すべて対象）
+    attr_pi_changes, attr_logs = diff_attributes(before_elem, after_elem)
+    if attr_pi_changes:
+        pre_pis.append(make_pi_attributes(attr_pi_changes, author, timestamp))
+        changes_log.append(
+            f"[{after_elem.tag}] 属性変更: {', '.join(attr_logs)}"
+        )
+
+    # 2. 要素内部のコンテンツ（テキスト＋子要素）を比較
+    b_tokens = tokenize_mixed_content(before_elem)
+    a_tokens = tokenize_mixed_content(after_elem)
+
+    if not b_tokens and not a_tokens:
+        return pre_pis
+
+    b_sigs = [token_signature(t) for t in b_tokens]
+    a_sigs = [token_signature(t) for t in a_tokens]
+
+    matcher = difflib.SequenceMatcher(None, b_sigs, a_sigs, autojunk=False)
+    new_tokens: list[tuple[str, str | ET.Element]] = []
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for k in range(j1, j2):
+                kind, val = a_tokens[k]
+                if kind == "elem":
+                    new_tokens.append(("node", val))
+                else:
+                    new_tokens.append((kind, val))
+
+        elif tag == "replace":
+            b_slice = b_tokens[i1:i2]
+            a_slice = a_tokens[j1:j2]
+            pair_count = min(len(b_slice), len(a_slice))
+
+            for k in range(pair_count):
+                b_kind, b_val = b_slice[k]
+                a_kind, a_val = a_slice[k]
+
+                # テキスト同士の置換 -> インライン文字/文節差分
+                if b_kind == "text" and a_kind == "text":
+                    assert isinstance(b_val, str) and isinstance(a_val, str)
+                    diff_toks = build_inline_text_diff_tokens(
+                        b_val, a_val, author, timestamp, changes_log, after_elem.tag
+                    )
+                    new_tokens.extend(diff_toks)
+
+                # 同じタグの要素同士の置換 -> さらに深く再帰比較
+                elif (
+                    b_kind == "elem"
+                    and a_kind == "elem"
+                    and isinstance(b_val, ET.Element)
+                    and isinstance(a_val, ET.Element)
+                    and b_val.tag == a_val.tag
+                ):
+                    child_pre_pis = compare_and_mark_elements(
+                        b_val, a_val, author, timestamp, changes_log
+                    )
+                    for pi in child_pre_pis:
+                        new_tokens.append(("node", pi))
+                    new_tokens.append(("node", a_val))
+
+                # 異なる種類または異なるタグへの置換 -> 削除PI ＋ 挿入PI
+                else:
+                    if b_kind == "text":
+                        assert isinstance(b_val, str)
+                        if b_val.strip():
+                            new_tokens.append(
+                                ("node", make_pi_delete(author, timestamp, b_val))
+                            )
+                            changes_log.append(
+                                f"[{after_elem.tag}] テキスト削除: 「{truncate_text(b_val)}」"
+                            )
+                    elif b_kind == "elem":
+                        assert isinstance(b_val, ET.Element)
+                        raw_xml = serialize_element_without_tail(b_val)
+                        new_tokens.append(
+                            ("node", make_pi_delete(author, timestamp, raw_xml))
+                        )
+                        changes_log.append(
+                            f"[{b_val.tag}] 要素削除: {truncate_text(raw_xml)}"
+                        )
+
+                    if a_kind == "text":
+                        assert isinstance(a_val, str)
+                        if a_val.strip():
+                            new_tokens.append(("node", make_pi_insert_start(author, timestamp)))
+                            new_tokens.append(("text", a_val))
+                            new_tokens.append(("node", make_pi_insert_end()))
+                            changes_log.append(
+                                f"[{after_elem.tag}] テキスト追加: 「{truncate_text(a_val)}」"
+                            )
+                        elif a_val:
+                            new_tokens.append(("text", a_val))
+                    elif a_kind == "elem":
+                        assert isinstance(a_val, ET.Element)
+                        raw_xml = serialize_element_without_tail(a_val)
+                        new_tokens.append(("node", make_pi_insert_start(author, timestamp)))
+                        new_tokens.append(("node", a_val))
+                        new_tokens.append(("node", make_pi_insert_end()))
+                        changes_log.append(
+                            f"[{a_val.tag}] 要素追加: {truncate_text(raw_xml)}"
+                        )
+
+            # 置換ブロック内で余剰となった追加分
+            for a_kind, a_val in a_slice[pair_count:]:
+                if a_kind == "text":
+                    assert isinstance(a_val, str)
+                    if a_val.strip():
+                        new_tokens.append(("node", make_pi_insert_start(author, timestamp)))
+                        new_tokens.append(("text", a_val))
+                        new_tokens.append(("node", make_pi_insert_end()))
+                        changes_log.append(
+                            f"[{after_elem.tag}] テキスト追加: 「{truncate_text(a_val)}」"
+                        )
+                    elif a_val:
+                        new_tokens.append(("text", a_val))
+                elif a_kind == "elem":
+                    assert isinstance(a_val, ET.Element)
+                    raw_xml = serialize_element_without_tail(a_val)
+                    new_tokens.append(("node", make_pi_insert_start(author, timestamp)))
+                    new_tokens.append(("node", a_val))
+                    new_tokens.append(("node", make_pi_insert_end()))
+                    changes_log.append(
+                        f"[{a_val.tag}] 要素追加: {truncate_text(raw_xml)}"
+                    )
+
+            # 置換ブロック内で余剰となった削除分
+            for b_kind, b_val in b_slice[pair_count:]:
+                if b_kind == "text":
+                    assert isinstance(b_val, str)
+                    if b_val.strip():
+                        new_tokens.append(
+                            ("node", make_pi_delete(author, timestamp, b_val))
+                        )
+                        changes_log.append(
+                            f"[{after_elem.tag}] テキスト削除: 「{truncate_text(b_val)}」"
+                        )
+                elif b_kind == "elem":
+                    assert isinstance(b_val, ET.Element)
+                    raw_xml = serialize_element_without_tail(b_val)
+                    new_tokens.append(
+                        ("node", make_pi_delete(author, timestamp, raw_xml))
+                    )
+                    changes_log.append(
+                        f"[{b_val.tag}] 要素削除: {truncate_text(raw_xml)}"
+                    )
+
+        elif tag == "insert":
+            for a_kind, a_val in a_tokens[j1:j2]:
+                if a_kind == "text":
+                    assert isinstance(a_val, str)
+                    if a_val.strip():
+                        new_tokens.append(("node", make_pi_insert_start(author, timestamp)))
+                        new_tokens.append(("text", a_val))
+                        new_tokens.append(("node", make_pi_insert_end()))
+                        changes_log.append(
+                            f"[{after_elem.tag}] テキスト追加: 「{truncate_text(a_val)}」"
+                        )
+                    elif a_val:
+                        new_tokens.append(("text", a_val))
+                elif a_kind == "elem":
+                    assert isinstance(a_val, ET.Element)
+                    raw_xml = serialize_element_without_tail(a_val)
+                    new_tokens.append(("node", make_pi_insert_start(author, timestamp)))
+                    new_tokens.append(("node", a_val))
+                    new_tokens.append(("node", make_pi_insert_end()))
+                    changes_log.append(
+                        f"[{a_val.tag}] 要素追加: {truncate_text(raw_xml)}"
+                    )
+                else:
+                    new_tokens.append(("node", a_val))
+
+        elif tag == "delete":
+            for b_kind, b_val in b_tokens[i1:i2]:
+                if b_kind == "text":
+                    assert isinstance(b_val, str)
+                    if b_val.strip():
+                        new_tokens.append(
+                            ("node", make_pi_delete(author, timestamp, b_val))
+                        )
+                        changes_log.append(
+                            f"[{after_elem.tag}] テキスト削除: 「{truncate_text(b_val)}」"
+                        )
+                elif b_kind == "elem":
+                    assert isinstance(b_val, ET.Element)
+                    raw_xml = serialize_element_without_tail(b_val)
+                    new_tokens.append(
+                        ("node", make_pi_delete(author, timestamp, raw_xml))
+                    )
+                    changes_log.append(
+                        f"[{b_val.tag}] 要素削除: {truncate_text(raw_xml)}"
+                    )
+
+    rebuild_mixed_content(after_elem, new_tokens)
+    return pre_pis
+
+
+def process_dita_folders(
+    before_dir: Path,
+    after_dir: Path,
+    output_dir: Path,
+    author: str,
+    timestamp: str,
+    log_callback,
+) -> tuple[int, int, int]:
+    """フォルダ内の全DITAファイルを比較・処理する"""
+    modified_count = 0
+    new_count = 0
+    unchanged_count = 0
+
+    target_exts = {".dita", ".xml"}
+    after_files = [
+        p for p in after_dir.rglob("*") if p.is_file() and p.suffix.lower() in target_exts
+    ]
+
+    if not after_files:
+        log_callback("警告: 変更後フォルダ内に .dita / .xml ファイルが見つかりませんでした。\n")
+        return 0, 0, 0
+
+    for after_path in sorted(after_files):
+        rel_path = after_path.relative_to(after_dir)
+        before_path = before_dir / rel_path
+        out_path = output_dir / rel_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        after_raw = after_path.read_text(encoding="utf-8")
+        header = extract_xml_header(after_raw)
+
+        try:
+            after_root = ET.fromstring(after_raw)
+        except ET.ParseError as e:
+            log_callback(f"[スキップ: XML解析エラー] {rel_path} ({e})\n")
+            shutil.copy2(after_path, out_path)
+            continue
+
+        changes_log: list[str] = []
+
+        # ケース1: 変更前フォルダに存在しない（新規追加ファイル）
+        if not before_path.exists():
+            pi_start = ET.tostring(make_pi_insert_start(author, timestamp), encoding="unicode")
+            pi_end = ET.tostring(make_pi_insert_end(), encoding="unicode")
+            xml_body = ET.tostring(after_root, encoding="unicode")
+            out_path.write_text(
+                f"{header}{pi_start}{xml_body}{pi_end}\n", encoding="utf-8"
+            )
+            new_count += 1
+            log_callback(f"[新規追加] {rel_path}\n")
+            continue
+
+        # ケース2: 変更前ファイルが存在する（差分比較）
+        before_raw = before_path.read_text(encoding="utf-8")
+        try:
+            before_root = ET.fromstring(before_raw)
+        except ET.ParseError as e:
+            log_callback(f"[スキップ: 変更前XML解析エラー] {rel_path} ({e})\n")
+            shutil.copy2(after_path, out_path)
+            continue
+
+        root_pre_pis = compare_and_mark_elements(
+            before_root, after_root, author, timestamp, changes_log
+        )
+
+        if changes_log:
+            root_pi_str = "".join(
+                ET.tostring(pi, encoding="unicode") + "\n" for pi in root_pre_pis
+            )
+            xml_body = ET.tostring(after_root, encoding="unicode")
+            out_path.write_text(
+                f"{header}{root_pi_str}{xml_body}\n", encoding="utf-8"
+            )
+            modified_count += 1
+            log_callback(f"[変更あり: {len(changes_log)}箇所] {rel_path}\n")
+            for item in changes_log:
+                log_callback(f"    ・{item}\n")
+        else:
+            shutil.copy2(after_path, out_path)
+            unchanged_count += 1
+            log_callback(f"[変更なし] {rel_path}\n")
+
+    return modified_count, new_count, unchanged_count
+
+
+class DitaDiffHistoryApp:
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.root.title("DITA 差分比較・Oxygen変更履歴自動付与ツール")
+        self.root.geometry("760x580")
+        self.root.minsize(680, 500)
+
+        self.before_var = tk.StringVar()
+        self.after_var = tk.StringVar()
+        self.output_var = tk.StringVar()
+        self.author_var = tk.StringVar(value=os.environ.get("USERNAME", ""))
+        self.timestamp_var = tk.StringVar()
+
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        pad = {"padx": 10, "pady": 5}
+        main_frame = ttk.Frame(self.root, padding=12)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # --- 1. フォルダ設定 ---
+        folder_frame = ttk.LabelFrame(main_frame, text="1. 対象フォルダ設定", padding=10)
+        folder_frame.pack(fill=tk.X, **pad)
+        folder_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(folder_frame, text="変更前フォルダ:").grid(row=0, column=0, sticky=tk.W, pady=3)
+        ttk.Entry(folder_frame, textvariable=self.before_var).grid(
+            row=0, column=1, sticky=tk.EW, padx=6
+        )
+        ttk.Button(
+            folder_frame, text="参照...", command=lambda: self._select_dir(self.before_var)
+        ).grid(row=0, column=2)
+
+        ttk.Label(folder_frame, text="変更後フォルダ:").grid(row=1, column=0, sticky=tk.W, pady=3)
+        ttk.Entry(folder_frame, textvariable=self.after_var).grid(
+            row=1, column=1, sticky=tk.EW, padx=6
+        )
+        ttk.Button(
+            folder_frame, text="参照...", command=self._select_after_dir
+        ).grid(row=1, column=2)
+
+        ttk.Label(folder_frame, text="出力先フォルダ:").grid(row=2, column=0, sticky=tk.W, pady=3)
+        ttk.Entry(folder_frame, textvariable=self.output_var).grid(
+            row=2, column=1, sticky=tk.EW, padx=6
+        )
+        ttk.Button(
+            folder_frame, text="参照...", command=lambda: self._select_dir(self.output_var)
+        ).grid(row=2, column=2)
+
+        # --- 2. 変更履歴メタデータ設定 ---
+        meta_frame = ttk.LabelFrame(main_frame, text="2. 変更履歴メタデータ", padding=10)
+        meta_frame.pack(fill=tk.X, **pad)
+        meta_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(meta_frame, text="変更者 (author):").grid(row=0, column=0, sticky=tk.W, pady=3)
+        ttk.Entry(meta_frame, textvariable=self.author_var).grid(
+            row=0, column=1, sticky=tk.EW, padx=6
+        )
+
+        ttk.Label(meta_frame, text="タイムスタンプ:").grid(row=1, column=0, sticky=tk.W, pady=3)
+        ts_box = ttk.Frame(meta_frame)
+        ts_box.grid(row=1, column=1, sticky=tk.EW, padx=6)
+        ts_box.columnconfigure(0, weight=1)
+        ttk.Entry(ts_box, textvariable=self.timestamp_var).grid(
+            row=0, column=0, sticky=tk.EW
+        )
+        ttk.Label(
+            ts_box,
+            text="※未指定時は現在時刻 (例: 20261117T143531+0900)",
+            foreground="#555555",
+        ).grid(row=0, column=1, padx=(8, 0))
+
+        # --- 3. 実行ボタン ---
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill=tk.X, padx=10, pady=8)
+        run_btn = ttk.Button(
+            btn_frame,
+            text="差分を比較して変更履歴を付与する",
+            command=self._run,
+        )
+        run_btn.pack(side=tk.RIGHT, ipadx=12, ipady=4)
+
+        # --- 4. 実行ログ ---
+        log_frame = ttk.LabelFrame(main_frame, text="実行ログ", padding=8)
+        log_frame.pack(fill=tk.BOTH, expand=True, **pad)
+        self.log_area = scrolledtext.ScrolledText(
+            log_frame, height=12, font=("Consolas", 9), state=tk.DISABLED
+        )
+        self.log_area.pack(fill=tk.BOTH, expand=True)
+
+    def _select_dir(self, target_var: tk.StringVar) -> None:
+        selected = filedialog.askdirectory()
+        if selected:
+            target_var.set(selected)
+
+    def _select_after_dir(self) -> None:
+        selected = filedialog.askdirectory()
+        if selected:
+            self.after_var.set(selected)
+            if not self.output_var.get().strip():
+                self.output_var.set(f"{selected}_with_history")
+
+    def _append_log(self, text: str) -> None:
+        self.log_area.configure(state=tk.NORMAL)
+        self.log_area.insert(tk.END, text)
+        self.log_area.see(tk.END)
+        self.log_area.configure(state=tk.DISABLED)
+        self.root.update_idletasks()
+
+    def _run(self) -> None:
+        before_str = self.before_var.get().strip()
+        after_str = self.after_var.get().strip()
+        output_str = self.output_var.get().strip()
+        author = self.author_var.get().strip()
+        timestamp = self.timestamp_var.get().strip()
+
+        if not before_str or not after_str or not output_str:
+            messagebox.showwarning("入力エラー", "変更前・変更後・出力先の全フォルダを指定してください。")
+            return
+
+        before_dir = Path(before_str)
+        after_dir = Path(after_str)
+        output_dir = Path(output_str)
+
+        if not before_dir.is_dir() or not after_dir.is_dir():
+            messagebox.showerror("パスエラー", "変更前または変更後フォルダが存在しません。")
+            return
+
+        if before_dir.resolve() == after_dir.resolve():
+            messagebox.showerror("パスエラー", "変更前と変更後に同じフォルダは指定できません。")
+            return
+
+        if not author:
+            messagebox.showwarning("入力エラー", "「変更者 (author)」を入力してください。")
+            return
+
+        # タイムスタンプ未指定時は現在時刻を使用 (YYYYMMDDTHHMMSS+ZZZZ)
+        if not timestamp:
+            timestamp = get_current_oxy_timestamp()
+
+        self.log_area.configure(state=tk.NORMAL)
+        self.log_area.delete("1.0", tk.END)
+        self.log_area.configure(state=tk.DISABLED)
+
+        self._append_log("=== 処理開始 ===\n")
+        self._append_log(f"変更者 (author): {author}\n")
+        self._append_log(f"タイムスタンプ (timestamp): {timestamp}\n")
+        self._append_log(f"出力先: {output_dir}\n\n")
+
+        mod_cnt, new_cnt, unch_cnt = process_dita_folders(
+            before_dir=before_dir,
+            after_dir=after_dir,
+            output_dir=output_dir,
+            author=author,
+            timestamp=timestamp,
+            log_callback=self._append_log,
+        )
+
+        summary = (
+            f"\n=== 処理完了 ===\n"
+            f"変更あり: {mod_cnt} 件 / 新規追加: {new_cnt} 件 / 変更なし: {unch_cnt} 件"
+        )
+        self._append_log(summary + "\n")
+        messagebox.showinfo("完了", f"変更履歴の付与が完了しました。\n\n{summary}")
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = DitaDiffHistoryApp(root)
+    root.mainloop()
