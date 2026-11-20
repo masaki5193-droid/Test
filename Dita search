@@ -1,0 +1,423 @@
+import datetime
+import os
+import subprocess
+import sys
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import unicodedata
+
+try:
+    import openpyxl
+    from openpyxl.styles import Alignment, Font, PatternFill
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
+
+
+def normalize_text(text: str, ignore_case: bool, ignore_width: bool) -> str:
+    """検索用に文字列を正規化する"""
+    result = text
+    if ignore_width:
+        # NFKC正規化により全角英数字・記号を半角に、半角カナを全角に統一
+        result = unicodedata.normalize("NFKC", result)
+    if ignore_case:
+        result = result.casefold()
+    return result
+
+
+def read_lines_safely(filepath: str) -> list[str]:
+    """文字コードを自動判別してファイルを読み込む"""
+    encodings = ["utf-8-sig", "utf-8", "cp932"]
+    for enc in encodings:
+        try:
+            with open(filepath, "r", encoding=enc) as f:
+                return f.readlines()
+        except UnicodeDecodeError:
+            continue
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        return f.readlines()
+
+
+def sanitize_for_excel(value) -> str:
+    """Excelのセルに書き込めない制御文字を除去する"""
+    text = str(value)
+    return "".join(ch for ch in text if ch in ("\t", "\n", "\r") or ord(ch) >= 32)
+
+
+class DitaSearchApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("DITAファイル 文字列検索ツール")
+        self.root.geometry("1050x680")
+        self.root.minsize(850, 520)
+
+        self.results: list[dict] = []
+        self.is_searching = False
+
+        # GUI変数
+        self.folder_var = tk.StringVar()
+        self.query_var = tk.StringVar()
+        self.ignore_case_var = tk.BooleanVar(value=True)
+        self.ignore_width_var = tk.BooleanVar(value=True)
+        self.include_filename_var = tk.BooleanVar(value=True)
+        self.include_subdirs_var = tk.BooleanVar(value=True)
+        self.status_var = tk.StringVar(value="フォルダと検索文字列を指定して「検索実行」を押してください。")
+
+        self._build_ui()
+
+    def _build_ui(self):
+        main_frame = ttk.Frame(self.root, padding=12)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # --- 条件入力エリア ---
+        cond_frame = ttk.LabelFrame(main_frame, text="検索条件", padding=10)
+        cond_frame.pack(fill=tk.X, pady=(0, 8))
+
+        # 1行目: フォルダ指定
+        row1 = ttk.Frame(cond_frame)
+        row1.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(row1, text="対象フォルダ:", width=14).pack(side=tk.LEFT)
+        folder_entry = ttk.Entry(row1, textvariable=self.folder_var)
+        folder_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        ttk.Button(row1, text="参照...", width=10, command=self._select_folder).pack(side=tk.LEFT)
+
+        # 2行目: 検索文字列
+        row2 = ttk.Frame(cond_frame)
+        row2.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(row2, text="検索文字列:", width=14).pack(side=tk.LEFT)
+        query_entry = ttk.Entry(row2, textvariable=self.query_var)
+        query_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        query_entry.bind("<Return>", lambda _e: self.start_search())
+
+        # 3行目: オプションチェックボックス
+        row3 = ttk.Frame(cond_frame)
+        row3.pack(fill=tk.X)
+        ttk.Checkbutton(
+            row3, text="大文字 / 小文字を無視する", variable=self.ignore_case_var
+        ).pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Checkbutton(
+            row3, text="全角 / 半角を無視する", variable=self.ignore_width_var
+        ).pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Checkbutton(
+            row3, text="ファイル名の一致も結果に含める", variable=self.include_filename_var
+        ).pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Checkbutton(
+            row3, text="サブフォルダも検索する", variable=self.include_subdirs_var
+        ).pack(side=tk.LEFT)
+
+        # --- 操作ボタン & ステータスエリア ---
+        action_frame = ttk.Frame(main_frame)
+        action_frame.pack(fill=tk.X, pady=(0, 8))
+
+        self.search_btn = ttk.Button(
+            action_frame, text="検索実行", width=14, command=self.start_search
+        )
+        self.search_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.export_btn = ttk.Button(
+            action_frame, text="Excelに出力", width=14, command=self.export_to_excel, state=tk.DISABLED
+        )
+        self.export_btn.pack(side=tk.LEFT, padx=(0, 12))
+
+        ttk.Label(action_frame, textvariable=self.status_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # --- 検索結果表示エリア（スクロール可能テーブル） ---
+        result_frame = ttk.LabelFrame(main_frame, text="検索結果（行をダブルクリックでファイルを開きます）", padding=6)
+        result_frame.pack(fill=tk.BOTH, expand=True)
+
+        columns = ("no", "match_type", "file_name", "rel_path", "line_num", "content")
+        self.tree = ttk.Treeview(result_frame, columns=columns, show="headings", selectmode="browse")
+
+        self.tree.heading("no", text="No.")
+        self.tree.heading("match_type", text="一致種別")
+        self.tree.heading("file_name", text="ファイル名")
+        self.tree.heading("rel_path", text="相対パス")
+        self.tree.heading("line_num", text="行番号")
+        self.tree.heading("content", text="該当内容")
+
+        self.tree.column("no", width=50, anchor=tk.CENTER, stretch=False)
+        self.tree.column("match_type", width=95, anchor=tk.CENTER, stretch=False)
+        self.tree.column("file_name", width=180, anchor=tk.W, stretch=False)
+        self.tree.column("rel_path", width=220, anchor=tk.W, stretch=False)
+        self.tree.column("line_num", width=70, anchor=tk.E, stretch=False)
+        self.tree.column("content", width=450, anchor=tk.W, stretch=True)
+
+        # ファイル名一致行の背景色をわずかに変えて視認性向上
+        self.tree.tag_configure("filename_match", background="#eef6ff")
+
+        v_scroll = ttk.Scrollbar(result_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        h_scroll = ttk.Scrollbar(result_frame, orient=tk.HORIZONTAL, command=self.tree.xview)
+        self.tree.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        v_scroll.grid(row=0, column=1, sticky="ns")
+        h_scroll.grid(row=1, column=0, sticky="ew")
+
+        result_frame.grid_rowconfigure(0, weight=1)
+        result_frame.grid_columnconfigure(0, weight=1)
+
+        self.tree.bind("<Double-1>", self._on_row_double_click)
+
+    def _select_folder(self):
+        selected = filedialog.askdirectory(title="DITAファイルが格納されたフォルダを選択")
+        if selected:
+            self.folder_var.set(selected)
+
+    def start_search(self):
+        if self.is_searching:
+            return
+
+        target_dir = self.folder_var.get().strip()
+        query = self.query_var.get()
+
+        if not target_dir or not os.path.isdir(target_dir):
+            messagebox.showwarning("入力エラー", "有効な対象フォルダを指定してください。")
+            return
+        if not query:
+            messagebox.showwarning("入力エラー", "検索文字列を入力してください。")
+            return
+
+        self.is_searching = True
+        self.search_btn.configure(state=tk.DISABLED)
+        self.export_btn.configure(state=tk.DISABLED)
+        self.tree.delete(*self.tree.get_children())
+        self.results.clear()
+        self.status_var.set("検索中...")
+
+        params = {
+            "target_dir": target_dir,
+            "query": query,
+            "ignore_case": self.ignore_case_var.get(),
+            "ignore_width": self.ignore_width_var.get(),
+            "include_filename": self.include_filename_var.get(),
+            "include_subdirs": self.include_subdirs_var.get(),
+        }
+
+        thread = threading.Thread(target=self._search_worker, args=(params,), daemon=True)
+        thread.start()
+
+    def _search_worker(self, params: dict):
+        target_dir = params["target_dir"]
+        query = params["query"]
+        ignore_case = params["ignore_case"]
+        ignore_width = params["ignore_width"]
+        include_filename = params["include_filename"]
+        include_subdirs = params["include_subdirs"]
+
+        norm_query = normalize_text(query, ignore_case, ignore_width)
+        found_items = []
+        scanned_files = 0
+
+        try:
+            dita_files = []
+            if include_subdirs:
+                for root_dir, _dirs, files in os.walk(target_dir):
+                    for fname in files:
+                        if fname.lower().endswith(".dita"):
+                            dita_files.append(os.path.join(root_dir, fname))
+            else:
+                for fname in os.listdir(target_dir):
+                    full_p = os.path.join(target_dir, fname)
+                    if os.path.isfile(full_p) and fname.lower().endswith(".dita"):
+                        dita_files.append(full_p)
+
+            dita_files.sort()
+
+            for full_path in dita_files:
+                scanned_files += 1
+                fname = os.path.basename(full_path)
+                rel_path = os.path.relpath(full_path, target_dir)
+
+                # 1. ファイル名の一致判定
+                if include_filename:
+                    norm_fname = normalize_text(fname, ignore_case, ignore_width)
+                    if norm_query in norm_fname:
+                        found_items.append({
+                            "match_type": "ファイル名",
+                            "file_name": fname,
+                            "rel_path": rel_path,
+                            "full_path": full_path,
+                            "line_num": "-",
+                            "content": f"[ファイル名一致] {fname}",
+                        })
+
+                # 2. ファイル本文の行単位検索
+                lines = read_lines_safely(full_path)
+                for idx, line in enumerate(lines, start=1):
+                    clean_line = line.rstrip("\r\n")
+                    norm_line = normalize_text(clean_line, ignore_case, ignore_width)
+                    if norm_query in norm_line:
+                        found_items.append({
+                            "match_type": "本文",
+                            "file_name": fname,
+                            "rel_path": rel_path,
+                            "full_path": full_path,
+                            "line_num": idx,
+                            "content": clean_line.strip(),
+                        })
+
+            self.root.after(0, self._on_search_complete, found_items, scanned_files, None)
+        except Exception as exc:
+            self.root.after(0, self._on_search_complete, [], scanned_files, str(exc))
+
+    def _on_search_complete(self, found_items: list[dict], scanned_files: int, error_msg: str | None):
+        self.is_searching = False
+        self.search_btn.configure(state=tk.NORMAL)
+
+        if error_msg:
+            self.status_var.set("検索中にエラーが発生しました。")
+            messagebox.showerror("エラー", f"検索処理中にエラーが発生しました:\n{error_msg}")
+            return
+
+        self.results = found_items
+        for i, item in enumerate(self.results, start=1):
+            tags = ("filename_match",) if item["match_type"] == "ファイル名" else ()
+            self.tree.insert(
+                "",
+                tk.END,
+                values=(
+                    i,
+                    item["match_type"],
+                    item["file_name"],
+                    item["rel_path"],
+                    item["line_num"],
+                    item["content"],
+                ),
+                tags=tags,
+            )
+
+        hit_count = len(self.results)
+        self.status_var.set(f"完了: {scanned_files} 件のDITAファイルを検索し、{hit_count} 件ヒットしました。")
+
+        if hit_count > 0:
+            self.export_btn.configure(state=tk.NORMAL)
+        else:
+            messagebox.showinfo("検索結果", "一致する項目は見つかりませんでした。")
+
+    def _on_row_double_click(self, _event):
+        selected_id = self.tree.focus()
+        if not selected_id:
+            return
+        index = self.tree.index(selected_id)
+        if 0 <= index < len(self.results):
+            filepath = self.results[index]["full_path"]
+            if os.path.exists(filepath):
+                try:
+                    if sys.platform.startswith("win"):
+                        os.startfile(filepath)
+                    elif sys.platform == "darwin":
+                        subprocess.run(["open", filepath], check=False)
+                    else:
+                        subprocess.run(["xdg-open", filepath], check=False)
+                except Exception as e:
+                    messagebox.showerror("起動エラー", f"ファイルを開けませんでした:\n{e}")
+
+    def export_to_excel(self):
+        if not OPENPYXL_AVAILABLE:
+            messagebox.showerror(
+                "ライブラリ不足",
+                "Excel出力には openpyxl が必要です。\nコマンドプロンプト等で `pip install openpyxl` を実行してください。",
+            )
+            return
+
+        if not self.results:
+            messagebox.showinfo("出力対象なし", "出力する検索結果がありません。")
+            return
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"DITA検索結果_{timestamp}.xlsx"
+        save_path = filedialog.asksaveasfilename(
+            title="Excelファイルの保存先を指定",
+            defaultextension=".xlsx",
+            initialfile=default_name,
+            filetypes=[("Excelファイル", "*.xlsx")],
+        )
+        if not save_path:
+            return
+
+        try:
+            wb = openpyxl.Workbook()
+
+            # --- シート1: 検索結果 ---
+            ws_res = wb.active
+            ws_res.title = "検索結果"
+
+            headers = ["No.", "一致種別", "ファイル名", "相対パス", "フルパス", "行番号", "該当内容"]
+            ws_res.append(headers)
+
+            header_fill = PatternFill(start_color="2F5597", end_color="2F5597", fill_type="solid")
+            header_font = Font(color="FFFFFF", bold=True)
+            filename_fill = PatternFill(start_color="EEF6FF", end_color="EEF6FF", fill_type="solid")
+
+            for col_idx in range(1, len(headers) + 1):
+                cell = ws_res.cell(row=1, column=col_idx)
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+
+            for idx, item in enumerate(self.results, start=1):
+                row_values = [
+                    idx,
+                    sanitize_for_excel(item["match_type"]),
+                    sanitize_for_excel(item["file_name"]),
+                    sanitize_for_excel(item["rel_path"]),
+                    sanitize_for_excel(item["full_path"]),
+                    item["line_num"],
+                    sanitize_for_excel(item["content"]),
+                ]
+                ws_res.append(row_values)
+
+                if item["match_type"] == "ファイル名":
+                    for col_idx in range(1, len(headers) + 1):
+                        ws_res.cell(row=idx + 1, column=col_idx).fill = filename_fill
+
+            ws_res.freeze_panes = "A2"
+            ws_res.auto_filter.ref = f"A1:G{len(self.results) + 1}"
+
+            col_widths = {
+                "A": 8,
+                "B": 14,
+                "C": 28,
+                "D": 36,
+                "E": 48,
+                "F": 10,
+                "G": 70,
+            }
+            for col_letter, width in col_widths.items():
+                ws_res.column_dimensions[col_letter].width = width
+
+            # --- シート2: 検索条件 ---
+            ws_cond = wb.create_sheet(title="検索条件")
+            cond_rows = [
+                ["項目", "設定値"],
+                ["検索実行日時", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+                ["対象フォルダ", sanitize_for_excel(self.folder_var.get())],
+                ["検索文字列", sanitize_for_excel(self.query_var.get())],
+                ["大文字 / 小文字を無視", "有効" if self.ignore_case_var.get() else "無効"],
+                ["全角 / 半角を無視", "有効" if self.ignore_width_var.get() else "無効"],
+                ["ファイル名の一致を含む", "有効" if self.include_filename_var.get() else "無効"],
+                ["サブフォルダ検索", "有効" if self.include_subdirs_var.get() else "無効"],
+                ["ヒット件数", len(self.results)],
+            ]
+            for r_idx, r_data in enumerate(cond_rows, start=1):
+                ws_cond.append(r_data)
+                if r_idx == 1:
+                    for c_idx in range(1, 3):
+                        c = ws_cond.cell(row=1, column=c_idx)
+                        c.fill = header_fill
+                        c.font = header_font
+
+            ws_cond.column_dimensions["A"].width = 26
+            ws_cond.column_dimensions["B"].width = 60
+
+            wb.save(save_path)
+            messagebox.showinfo("出力完了", f"Excelファイルを保存しました:\n{save_path}")
+        except Exception as exc:
+            messagebox.showerror("保存エラー", f"Excelファイルの保存に失敗しました:\n{exc}")
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = DitaSearchApp(root)
+    root.mainloop()
